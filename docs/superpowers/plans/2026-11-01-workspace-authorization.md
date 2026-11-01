@@ -77,6 +77,7 @@ server-derived workspace scope and membership API.
 **Files:**
 - Create: `src/rag_pipeline/workspaces.py`
 - Create: `src/rag_pipeline/email.py`
+- Create: `migrations/versions/0003_workspace_invitations.py`
 - Modify: `src/rag_pipeline/api.py`
 - Modify: `src/rag_pipeline/models.py`
 - Modify: `docker-compose.yml`
@@ -84,24 +85,24 @@ server-derived workspace scope and membership API.
 - Test: `tests/test_core.py`
 
 **Interfaces:**
-- Produces: `GET /v1/workspaces`, `GET/POST /v1/workspaces/{workspace_id}/members`, `PUT/DELETE /v1/workspaces/{workspace_id}/members/{user_id}`, `POST /v1/workspaces/{workspace_id}/invitations`, and platform-admin-only `GET/POST /v1/roles`.
+- Produces: `GET /v1/workspaces`, `GET/POST /v1/workspaces/{workspace_id}/members`, `PUT/DELETE /v1/workspaces/{workspace_id}/members/{user_id}`, `POST /v1/workspaces/{workspace_id}/invitations`, authenticated `GET /v1/roles`, and platform-admin-only `POST /v1/roles`.
 - Invitation acceptance must bind the authenticated Keycloak subject and
   verified email to a single-use, expiring invitation. Email uses configured
   SMTP; local Compose routes to Mailpit. Role values must be existing
   administrator-approved global roles.
 - `POST /v1/invitations/{token}/accept` is the invitation acceptance endpoint.
 
-- [ ] **Step 1: Write failing tests** for listing only caller memberships, platform-admin workspace listing, workspace-admin invite/remove/role assignment, employee denial, platform-admin-only role creation, role validation, SMTP invitation delivery, authenticated invitation acceptance, expired/reused/email-mismatch invitation rejection, and cross-workspace denial.
-- [ ] **Step 2: Run** `python -m pytest tests/test_core.py -k workspace_api`; confirm endpoint authorization tests fail.
-- [ ] **Step 3: Implement** typed request/response models, routes, and an SMTP email adapter. Workspace admins may administer only their own workspace; only platform admins may define global role names. Store only a hash of each invitation token.
-- [ ] **Step 4: Run** focused tests and API OpenAPI generation; confirm no route trusts an unverified workspace ID.
+- [x] **Step 1: Write failing tests** for listing only caller memberships, platform-admin workspace listing, workspace-admin invite/remove/role assignment, employee denial, platform-admin-only role creation, role validation, SMTP invitation delivery, authenticated invitation acceptance, expired/reused/email-mismatch invitation rejection, and cross-workspace denial.
+- [x] **Step 2: Run** focused workspace/OIDC tests; confirm endpoint authorization tests fail before route registration.
+- [x] **Step 3: Implement** typed request/response models, routes, and an SMTP email adapter. Workspace admins may administer only their own workspace; only platform admins may define global role names. Store only a hash of each invitation token.
+- [x] **Step 4: Run** focused tests and API OpenAPI generation; confirm no route trusts an unverified workspace ID.
 - [ ] **Step 5: Commit** route, service, and endpoint tests.
 
 ### Task 4: Audit privileged workspace access
 
 **Files:**
 - Create: `src/rag_pipeline/audit.py`
-- Create: `migrations/versions/0003_admin_audit_events.py`
+- Create: `migrations/versions/0004_admin_audit_events.py`
 - Modify: `src/rag_pipeline/workspaces.py`
 - Modify: `src/rag_pipeline/api.py`
 - Test: `tests/test_core.py`

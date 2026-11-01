@@ -58,7 +58,7 @@ interfaces and conversation routes depend on its authenticated workspace scope.
 
 **Files:**
 - Create: `src/rag_pipeline/lexical_store.py`
-- Create: `migrations/versions/0004_document_chunk_catalog.py`
+- Create: `migrations/versions/0005_document_chunk_catalog.py`
 - Modify: `src/rag_pipeline/storage.py`
 - Modify: `src/rag_pipeline/retrieval.py`
 - Modify: `src/rag_pipeline/service.py`
@@ -79,7 +79,7 @@ interfaces and conversation routes depend on its authenticated workspace scope.
 ### Task 3: Make conversation history durable
 
 **Files:**
-- Create: `migrations/versions/0005_conversations.py`
+- Create: `migrations/versions/0006_conversations.py`
 - Create: `src/rag_pipeline/conversations.py`
 - Modify: `src/rag_pipeline/service.py`
 - Modify: `src/rag_pipeline/api.py`

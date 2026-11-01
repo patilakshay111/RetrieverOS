@@ -15,6 +15,15 @@ services:
       USER_KEY_ENCRYPTION_KEY: ${USER_KEY_ENCRYPTION_KEY:?Run scripts/init_local_env.py to generate local secrets}
       DATA_DIR: /app/data/runtime
       RERANKER_ENABLED: ${RERANKER_ENABLED:-true}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8501}
+      WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:5173}
+      INVITATION_EXPIRY_HOURS: ${INVITATION_EXPIRY_HOURS:-72}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_USE_STARTTLS: ${SMTP_USE_STARTTLS:-false}
+      SMTP_FROM: ${SMTP_FROM:-Hybrid RAG <no-reply@hybrid-rag.local>}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -28,6 +37,8 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_healthy
+      mailpit:
+        condition: service_started
     healthcheck:
       test:
         - CMD

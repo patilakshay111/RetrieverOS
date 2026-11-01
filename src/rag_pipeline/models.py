@@ -24,6 +24,8 @@ class AccessContext(BaseModel):
 class VerifiedIdentity(BaseModel):
     user_id: str = Field(min_length=1, max_length=255)
     platform_admin: bool = False
+    email: str | None = Field(default=None, max_length=254)
+    email_verified: bool = False
 
 
 class WorkspaceAccessContext(AccessContext):

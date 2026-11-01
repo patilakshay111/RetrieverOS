@@ -43,12 +43,15 @@ class OIDCVerifier:
         realm_roles = realm_access.get("roles", []) if isinstance(realm_access, dict) else []
         if not isinstance(realm_roles, list):
             realm_roles = []
+        email_claim = claims.get("email")
         return VerifiedIdentity(
             user_id=subject,
             platform_admin=any(
                 isinstance(role, str) and role == "platform-admin"
                 for role in realm_roles
             ),
+            email=email_claim.strip() if isinstance(email_claim, str) and email_claim.strip() else None,
+            email_verified=claims.get("email_verified") is True,
         )
 
 

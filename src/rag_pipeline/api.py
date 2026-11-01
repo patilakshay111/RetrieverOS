@@ -27,6 +27,7 @@ from rag_pipeline.models import (
     WorkspaceAccessContext,
 )
 from rag_pipeline.service import RAGService
+from rag_pipeline.workspaces import create_workspace_router
 
 
 # Expose one optional API-key header so development can stay frictionless.
@@ -196,22 +197,34 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     )
 
     # Authenticate a signed Keycloak identity, retaining API-key mode only for local use.
-    def authorize(
+    def authenticate(
         api_key: Annotated[str | None, Depends(api_key_header)],
         credentials: Annotated[
             HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
         ],
-        workspace_id: Annotated[
-            str | None, Header(alias="X-Workspace-ID", max_length=512)
-        ] = None,
-    ) -> WorkspaceAccessContext:
+    ) -> VerifiedIdentity:
         if oidc_verifier is not None:
             if credentials is None or credentials.scheme.casefold() != "bearer":
                 raise HTTPException(status_code=401, detail="A valid bearer token is required.")
             try:
-                identity: VerifiedIdentity = oidc_verifier.verify(credentials.credentials)
+                return oidc_verifier.verify(credentials.credentials)
             except (jwt.PyJWTError, OSError, ValueError) as error:
                 raise HTTPException(status_code=401, detail="The bearer token is invalid.") from error
+        if configured.app_env == "production":
+            raise HTTPException(status_code=503, detail="OIDC authentication is not configured.")
+        if configured.api_key and (
+            api_key is None or not secrets.compare_digest(api_key, configured.api_key)
+        ):
+            raise HTTPException(status_code=401, detail="A valid X-API-Key header is required.")
+        return VerifiedIdentity(user_id="local", platform_admin=True)
+
+    def authorize(
+        identity: Annotated[VerifiedIdentity, Depends(authenticate)],
+        workspace_header: Annotated[
+            str | None, Header(alias="X-Workspace-ID", max_length=512)
+        ] = None,
+    ) -> WorkspaceAccessContext:
+        if oidc_verifier is not None:
             if workspace_store is None:
                 raise HTTPException(
                     status_code=503,
@@ -221,14 +234,14 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
                 personal_membership = workspace_store.create_personal_workspace(
                     identity.user_id
                 )
-                if workspace_id is not None and not workspace_id.strip():
+                if workspace_header is not None and not workspace_header.strip():
                     raise HTTPException(
                         status_code=422,
                         detail="X-Workspace-ID must not be empty.",
                     )
                 selected_workspace_id = (
-                    workspace_id
-                    if workspace_id is not None
+                    workspace_header
+                    if workspace_header is not None
                     else personal_membership.workspace_id
                 )
                 workspace = workspace_store.get_workspace(selected_workspace_id)
@@ -262,18 +275,16 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
                     status_code=503,
                     detail="Unable to resolve workspace membership.",
                 ) from error
-        if configured.app_env == "production":
-            raise HTTPException(status_code=503, detail="OIDC authentication is not configured.")
-        if configured.api_key and (
-            api_key is None or not secrets.compare_digest(api_key, configured.api_key)
-        ):
-            raise HTTPException(status_code=401, detail="A valid X-API-Key header is required.")
         return WorkspaceAccessContext(
-            user_id="local",
+            user_id=identity.user_id,
             workspace_id="local",
             roles=frozenset({"admin"}),
-            platform_admin=True,
+            platform_admin=identity.platform_admin,
         )
+
+    app.include_router(
+        create_workspace_router(workspace_store, configured, authorize, authenticate)
+    )
 
     # Resolve the shared service lazily and return setup errors as explicit service failures.
     def get_runtime() -> RAGService:

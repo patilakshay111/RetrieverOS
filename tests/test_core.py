@@ -367,6 +367,7 @@ def test_production_api_authentication():
     settings = replace(
         Settings.from_env(),
         app_env="production",
+        web_base_url="https://app.example.test",
         api_key=None,
         oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
         openai_api_key="test-openai-key",
@@ -431,15 +432,24 @@ def test_oidc_verifier_validates_signature_issuer_audience_and_access_claims():
         "exp": now + timedelta(minutes=5),
         "workspace_id": "workspace-abc",
         "roles": ["hr"],
+        "email": "user@example.test",
+        "email_verified": True,
         "realm_access": {"roles": ["platform-admin"]},
     }
     token = jwt.encode(claims, private_key, algorithm="RS256")
 
     context = verifier.verify(token)
 
-    assert context == VerifiedIdentity(user_id="user-123", platform_admin=True)
+    assert context == VerifiedIdentity(
+        user_id="user-123",
+        platform_admin=True,
+        email="user@example.test",
+        email_verified=True,
+    )
     assert not hasattr(context, "workspace_id")
     assert not hasattr(context, "roles")
+    assert context.email == "user@example.test"
+    assert context.email_verified
 
     claims["aud"] = "different-api"
     invalid_token = jwt.encode(claims, private_key, algorithm="RS256")
@@ -591,7 +601,12 @@ def test_workspace_membership_schema_migration(tmp_path, monkeypatch):
     )
     engine.dispose()
 
-    assert {"workspaces", "workspace_memberships", "role_definitions"} <= tables
+    assert {
+        "workspaces",
+        "workspace_memberships",
+        "role_definitions",
+        "workspace_invitations",
+    } <= tables
     assert workspace_id == 512
     assert membership_workspace_id == 512
 
@@ -760,6 +775,7 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
     settings = replace(
         Settings.from_env(),
         app_env="production",
+        web_base_url="https://app.example.test",
         api_key=None,
         oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
         openai_api_key=None,
@@ -850,3 +866,310 @@ def test_graph_clients_are_built_with_the_callers_key(monkeypatch):
     assert service._graph_for_key("alice-openai-key") is alice_graph
     assert received_embedding_keys == ["alice-openai-key", "bob-openai-key"]
     assert received_generation_keys == ["alice-openai-key", "bob-openai-key"]
+
+
+@pytest.fixture
+def workspace_api(tmp_path):
+    from cryptography.fernet import Fernet
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+    from rag_pipeline.config import Settings
+    from rag_pipeline.identity_store import WorkspaceStore
+    from rag_pipeline.models import VerifiedIdentity
+
+    database_url = f"sqlite:///{(tmp_path / 'workspace-api.sqlite').as_posix()}"
+    store = WorkspaceStore(database_url)
+    owner_personal = store.create_personal_workspace("owner")
+    shared = store.create_workspace("Operations")
+    store.add_membership("owner", shared.id, roles={"admin"})
+    employee_personal = store.create_personal_workspace("employee")
+    store.add_membership("employee", owner_personal.workspace_id, roles={"employee"})
+    other_personal = store.create_personal_workspace("other")
+    identities = {
+        "owner-token": VerifiedIdentity(
+            user_id="owner", email="owner@example.test", email_verified=True
+        ),
+        "employee-token": VerifiedIdentity(
+            user_id="employee", email="employee@example.test", email_verified=True
+        ),
+        "other-token": VerifiedIdentity(
+            user_id="other", email="other@example.test", email_verified=True
+        ),
+        "invitee-token": VerifiedIdentity(
+            user_id="invitee", email="invitee@example.test", email_verified=True
+        ),
+        "wrong-email-token": VerifiedIdentity(
+            user_id="wrong-email", email="attacker@example.test", email_verified=True
+        ),
+        "unverified-email-token": VerifiedIdentity(
+            user_id="unverified-email",
+            email="invitee@example.test",
+            email_verified=False,
+        ),
+        "platform-token": VerifiedIdentity(
+            user_id="platform", platform_admin=True, email="platform@example.test",
+            email_verified=True,
+        ),
+    }
+
+    class StaticVerifier:
+        def verify(self, token: str) -> VerifiedIdentity:
+            return identities[token]
+
+    sent_messages = []
+
+    class FakeMailer:
+        def __init__(self, _settings):
+            pass
+
+        def send_invitation(self, email: str, invite_url: str) -> None:
+            if email == "smtp-failure@example.test":
+                raise RuntimeError("SMTP unavailable")
+            sent_messages.append((email, invite_url))
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        api_key=None,
+        oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
+        database_url=database_url,
+        user_key_encryption_key=Fernet.generate_key().decode("ascii"),
+    )
+    with (
+        patch("rag_pipeline.api.build_oidc_verifier", return_value=StaticVerifier()),
+        patch("rag_pipeline.api.WorkspaceStore", return_value=store),
+        patch("rag_pipeline.workspaces.SMTPInvitationMailer", FakeMailer),
+        TestClient(create_app(settings=settings, service=SimpleNamespace())) as client,
+    ):
+        yield SimpleNamespace(
+            client=client,
+            store=store,
+            database_url=database_url,
+            sent_messages=sent_messages,
+            owner_workspace_id=owner_personal.workspace_id,
+            shared_workspace_id=shared.id,
+            employee_workspace_id=employee_personal.workspace_id,
+            other_workspace_id=other_personal.workspace_id,
+        )
+
+
+def test_workspace_member_management_is_scoped_and_uses_existing_roles(workspace_api):
+    client = workspace_api.client
+    owner_headers = {"Authorization": "Bearer owner-token"}
+    employee_headers = {"Authorization": "Bearer employee-token"}
+    workspace_id = workspace_api.owner_workspace_id
+
+    listed = client.get("/v1/workspaces", headers=owner_headers)
+    assert listed.status_code == 200
+    assert {workspace["id"] for workspace in listed.json()} == {
+        workspace_id,
+        workspace_api.shared_workspace_id,
+    }
+    employee_workspaces = client.get(
+        "/v1/workspaces", headers=employee_headers
+    )
+    assert employee_workspaces.status_code == 200
+    assert {workspace["id"] for workspace in employee_workspaces.json()} == {
+        workspace_api.employee_workspace_id,
+        workspace_id,
+    }
+
+    members = client.get(
+        f"/v1/workspaces/{workspace_id}/members", headers=owner_headers
+    )
+    assert members.status_code == 200
+    assert {member["user_id"] for member in members.json()} == {"employee", "owner"}
+
+    assert client.get(
+        f"/v1/workspaces/{workspace_id}/members", headers=employee_headers
+    ).status_code == 403
+    assert client.get(
+        f"/v1/workspaces/{workspace_api.other_workspace_id}/members",
+        headers=owner_headers,
+    ).status_code == 403
+
+    updated = client.put(
+        f"/v1/workspaces/{workspace_id}/members/employee",
+        headers=owner_headers,
+        json={"roles": ["hr"], "status": "active"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["roles"] == ["hr"]
+
+    created = client.post(
+        f"/v1/workspaces/{workspace_id}/members",
+        headers=owner_headers,
+        json={"user_id": "new-member", "roles": ["employee"]},
+    )
+    assert created.status_code == 201
+    assert created.json()["roles"] == ["employee"]
+
+    assert client.put(
+        f"/v1/workspaces/{workspace_id}/members/employee",
+        headers=employee_headers,
+        json={"roles": ["admin"], "status": "active"},
+    ).status_code == 403
+    assert client.delete(
+        f"/v1/workspaces/{workspace_id}/members/employee",
+        headers=owner_headers,
+    ).status_code == 204
+    assert client.get(
+        f"/v1/workspaces/{workspace_id}/members",
+        headers=employee_headers,
+    ).status_code == 403
+
+
+def test_workspace_roles_are_visible_to_members_but_only_platform_admin_can_define(
+    workspace_api,
+):
+    client = workspace_api.client
+
+    roles = client.get("/v1/roles", headers={"Authorization": "Bearer owner-token"})
+    assert roles.status_code == 200
+    assert {"admin", "ceo", "employee", "hr"} <= {role["name"] for role in roles.json()}
+
+    body = {"name": "analyst"}
+    assert client.post(
+        "/v1/roles", headers={"Authorization": "Bearer owner-token"}, json=body
+    ).status_code == 403
+    assert client.post(
+        "/v1/roles", headers={"Authorization": "Bearer platform-token"}, json=body
+    ).status_code == 201
+    assert client.post(
+        "/v1/roles",
+        headers={"Authorization": "Bearer platform-token"},
+        json={"name": "invalid role"},
+    ).status_code == 422
+    assert client.get(
+        "/v1/roles", headers={"Authorization": "Bearer employee-token"}
+    ).status_code == 200
+
+    all_workspaces = client.get(
+        "/v1/workspaces", headers={"Authorization": "Bearer platform-token"}
+    )
+    assert all_workspaces.status_code == 200
+    assert len(all_workspaces.json()) == 5
+
+
+def test_workspace_invitation_is_hashed_single_use_and_email_bound(workspace_api):
+    from hashlib import sha256
+    from urllib.parse import parse_qs, urlparse
+
+    from sqlalchemy import create_engine, text
+
+    client = workspace_api.client
+    headers = {"Authorization": "Bearer owner-token"}
+    response = client.post(
+        f"/v1/workspaces/{workspace_api.owner_workspace_id}/invitations",
+        headers=headers,
+        json={"email": "invitee@example.test", "roles": ["employee"]},
+    )
+    assert response.status_code == 201
+    assert "token" not in response.json()
+    email, invite_url = workspace_api.sent_messages[-1]
+    assert email == "invitee@example.test"
+    token = parse_qs(urlparse(invite_url).query)["token"][0]
+
+    engine = create_engine(workspace_api.database_url)
+    with engine.connect() as connection:
+        token_hash = connection.execute(
+            text("SELECT token_hash FROM workspace_invitations WHERE id = :id"),
+            {"id": response.json()["id"]},
+        ).scalar_one()
+    engine.dispose()
+    assert token_hash == sha256(token.encode("utf-8")).hexdigest()
+    assert token not in token_hash
+
+    mismatched_email = client.post(
+        f"/v1/invitations/{token}/accept",
+        headers={"Authorization": "Bearer wrong-email-token"},
+    )
+    assert mismatched_email.status_code == 403
+    client.headers.update({"X-Workspace-ID": workspace_api.owner_workspace_id})
+    accepted = client.post(
+        f"/v1/invitations/{token}/accept",
+        headers={"Authorization": "Bearer invitee-token"},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["roles"] == ["employee"]
+    assert client.post(
+        f"/v1/invitations/{token}/accept",
+        headers={"Authorization": "Bearer invitee-token"},
+    ).status_code == 409
+
+
+def test_workspace_invitation_rejects_expired_or_unverified_email(workspace_api):
+    from datetime import datetime, timedelta, timezone
+    from urllib.parse import parse_qs, urlparse
+
+    from sqlalchemy import create_engine, text
+
+    client = workspace_api.client
+    headers = {"Authorization": "Bearer owner-token"}
+    invitation = client.post(
+        f"/v1/workspaces/{workspace_api.owner_workspace_id}/invitations",
+        headers=headers,
+        json={"email": "invitee@example.test", "roles": ["employee"]},
+    )
+    assert invitation.status_code == 201
+    token = parse_qs(urlparse(workspace_api.sent_messages[-1][1]).query)["token"][0]
+    assert invitation.status_code == 201
+
+    assert client.post(
+        f"/v1/invitations/{token}/accept",
+        headers={"Authorization": "Bearer wrong-email-token"},
+    ).status_code == 403
+    assert client.post(
+        f"/v1/invitations/{token}/accept",
+        headers={"Authorization": "Bearer unverified-email-token"},
+    ).status_code == 403
+
+    expired = client.post(
+        f"/v1/workspaces/{workspace_api.owner_workspace_id}/invitations",
+        headers=headers,
+        json={"email": "invitee@example.test", "roles": ["employee"]},
+    )
+    assert expired.status_code == 201
+    expired_token = parse_qs(urlparse(workspace_api.sent_messages[-1][1]).query)["token"][0]
+    engine = create_engine(workspace_api.database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workspace_invitations SET expires_at = :expires_at WHERE id = :id"
+            ),
+            {
+                "expires_at": (
+                    datetime.now(timezone.utc) - timedelta(minutes=1)
+                ).isoformat(),
+                "id": expired.json()["id"],
+            },
+        )
+    engine.dispose()
+    assert client.post(
+        f"/v1/invitations/{expired_token}/accept",
+        headers={"Authorization": "Bearer invitee-token"},
+    ).status_code == 410
+
+
+def test_workspace_invitation_reports_smtp_failure_without_leaking_token(workspace_api):
+    from sqlalchemy import create_engine, text
+
+    response = workspace_api.client.post(
+        f"/v1/workspaces/{workspace_api.owner_workspace_id}/invitations",
+        headers={"Authorization": "Bearer owner-token"},
+        json={"email": "smtp-failure@example.test", "roles": ["employee"]},
+    )
+
+    assert response.status_code == 503
+    assert "SMTP unavailable" not in response.text
+    assert "token" not in response.text.lower()
+    engine = create_engine(workspace_api.database_url)
+    with engine.connect() as connection:
+        pending_count = connection.execute(
+            text("SELECT count(*) FROM workspace_invitations")
+        ).scalar_one()
+    engine.dispose()
+    assert pending_count == 0

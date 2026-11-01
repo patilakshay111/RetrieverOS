@@ -56,6 +56,14 @@ class Settings:
     min_retrieval_confidence: float
     max_upload_bytes: int
     cors_origins: tuple[str, ...]
+    web_base_url: str
+    invitation_expiry_hours: int
+    smtp_host: str | None
+    smtp_port: int
+    smtp_username: str | None
+    smtp_password: str | None
+    smtp_use_starttls: bool
+    smtp_from: str | None
 
     # Read configuration values and reject unsafe or inconsistent settings early.
     @classmethod
@@ -91,9 +99,20 @@ class Settings:
             max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))),
             cors_origins=tuple(
                 origin.strip()
-                for origin in os.getenv("CORS_ORIGINS", "http://localhost:8501").split(",")
+                for origin in os.getenv(
+                    "CORS_ORIGINS",
+                    "http://localhost:5173,http://localhost:8501",
+                ).split(",")
                 if origin.strip()
             ),
+            web_base_url=os.getenv("WEB_BASE_URL", "http://localhost:5173").rstrip("/"),
+            invitation_expiry_hours=int(os.getenv("INVITATION_EXPIRY_HOURS", "72")),
+            smtp_host=os.getenv("SMTP_HOST") or None,
+            smtp_port=int(os.getenv("SMTP_PORT", "1025")),
+            smtp_username=os.getenv("SMTP_USERNAME") or None,
+            smtp_password=os.getenv("SMTP_PASSWORD") or None,
+            smtp_use_starttls=_read_bool("SMTP_USE_STARTTLS", False),
+            smtp_from=os.getenv("SMTP_FROM") or None,
         )
         if settings.chunk_size <= 0 or not 0 <= settings.chunk_overlap < settings.chunk_size:
             raise ValueError("CHUNK_SIZE must be positive and CHUNK_OVERLAP smaller than CHUNK_SIZE.")
@@ -124,6 +143,20 @@ class Settings:
             raise ValueError("APP_ENV must be development, test, or production.")
         if settings.max_upload_bytes <= 0:
             raise ValueError("MAX_UPLOAD_BYTES must be positive.")
+        if not 1 <= settings.invitation_expiry_hours <= 720:
+            raise ValueError("INVITATION_EXPIRY_HOURS must be between 1 and 720.")
+        if not 1 <= settings.smtp_port <= 65535:
+            raise ValueError("SMTP_PORT must be between 1 and 65535.")
+        if bool(settings.smtp_username) != bool(settings.smtp_password):
+            raise ValueError("SMTP_USERNAME and SMTP_PASSWORD must be configured together.")
+        web_url = urlparse(settings.web_base_url)
+        if (
+            web_url.scheme not in {"http", "https"}
+            or not web_url.netloc
+            or web_url.query
+            or web_url.fragment
+        ):
+            raise ValueError("WEB_BASE_URL must be an HTTP(S) origin or base path.")
         if settings.app_env == "production" and "*" in settings.cors_origins:
             raise ValueError("Production CORS_ORIGINS must not contain '*'.")
         return settings
@@ -152,6 +185,16 @@ class Settings:
             raise ValueError("Production DATABASE_URL must use PostgreSQL.")
         if self.app_env == "production" and not self.user_key_encryption_key:
             raise ValueError("USER_KEY_ENCRYPTION_KEY is required when APP_ENV=production.")
+        if (
+            self.app_env == "production"
+            and self.smtp_host
+            and (not self.smtp_from or not self.smtp_use_starttls)
+        ):
+            raise ValueError(
+                "Production SMTP requires SMTP_FROM and SMTP_USE_STARTTLS=true."
+            )
+        if self.app_env == "production" and urlparse(self.web_base_url).scheme != "https":
+            raise ValueError("Production WEB_BASE_URL must use HTTPS.")
         if self.app_env == "production" and not self.openai_api_key and not (
             self.database_url and self.user_key_encryption_key
         ):
