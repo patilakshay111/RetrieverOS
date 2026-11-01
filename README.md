@@ -138,7 +138,7 @@ These diagrams follow the implemented ingestion and question-answering paths. Th
 
 ```mermaid
 %%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
-flowchart TD
+flowchart LR
     upload["Document upload"] --> api["POST /v1/ingest"]
     samples["Sample documents"] --> seed["seed.py"]
     archive["Archived documents"] --> reindex["reindex.py<br/>verify source hash"]
