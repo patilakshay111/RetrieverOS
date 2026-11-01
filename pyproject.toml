@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "internal-docs-hybrid-rag"
+version = "1.0.0"
+description = "Grounded internal-document Q&A with hybrid retrieval and citation checks."
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "faiss-cpu>=1.8",
+    "fastapi>=0.115",
+    "langchain-openai>=0.2",
+    "langchain-text-splitters>=0.3",
+    "langgraph>=0.2",
+    "numpy>=1.26",
+    "pydantic>=2.8",
+    "pypdf>=5.0",
+    "python-dotenv>=1.0",
+    "python-multipart>=0.0.12",
+    "rank-bm25>=0.2.2",
+    "requests>=2.32",
+    "sentence-transformers>=3.2",
+    "streamlit>=1.57",
+    "uvicorn[standard]>=0.32",
+]
+
+[project.scripts]
+rag-pipeline-seed = "rag_pipeline.seed:main"
+rag-pipeline-reindex = "rag_pipeline.reindex:main"
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8.3",
+    "langgraph-api>=0.17.0",
+    "langgraph-cli[inmem]>=0.1.71",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["rag_pipeline*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
