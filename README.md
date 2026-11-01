@@ -168,7 +168,7 @@ flowchart TD
 
 ```mermaid
 %%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
-flowchart TD
+flowchart LR
     client["Streamlit or API client"] --> ask["POST /v1/ask"]
     ask --> workflow["RAGService / LangGraph<br/>load thread history"]
     workflow --> query["Build query from question<br/>and recent history"]
