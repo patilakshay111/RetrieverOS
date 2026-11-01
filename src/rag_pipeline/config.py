@@ -38,6 +38,8 @@ class Settings:
     oidc_jwks_url: str | None
     oidc_audience: str
     database_url: str | None
+    qdrant_url: str | None
+    qdrant_vector_size: int
     user_key_encryption_key: str | None
     data_dir: Path
     chunk_size: int
@@ -78,6 +80,8 @@ class Settings:
             oidc_jwks_url=os.getenv("OIDC_JWKS_URL") or None,
             oidc_audience=os.getenv("OIDC_AUDIENCE", "hybrid-rag-api"),
             database_url=os.getenv("DATABASE_URL") or None,
+            qdrant_url=os.getenv("QDRANT_URL") or None,
+            qdrant_vector_size=int(os.getenv("QDRANT_VECTOR_SIZE", "1536")),
             user_key_encryption_key=os.getenv("USER_KEY_ENCRYPTION_KEY") or None,
             data_dir=Path(os.getenv("DATA_DIR", "data/runtime")).expanduser(),
             chunk_size=int(os.getenv("CHUNK_SIZE", "900")),
@@ -143,6 +147,8 @@ class Settings:
             raise ValueError("APP_ENV must be development, test, or production.")
         if settings.max_upload_bytes <= 0:
             raise ValueError("MAX_UPLOAD_BYTES must be positive.")
+        if settings.qdrant_vector_size <= 0:
+            raise ValueError("QDRANT_VECTOR_SIZE must be positive.")
         if not 1 <= settings.invitation_expiry_hours <= 720:
             raise ValueError("INVITATION_EXPIRY_HOURS must be between 1 and 720.")
         if not 1 <= settings.smtp_port <= 65535:
@@ -159,6 +165,15 @@ class Settings:
             raise ValueError("WEB_BASE_URL must be an HTTP(S) origin or base path.")
         if settings.app_env == "production" and "*" in settings.cors_origins:
             raise ValueError("Production CORS_ORIGINS must not contain '*'.")
+        if settings.qdrant_url:
+            qdrant_url = urlparse(settings.qdrant_url)
+            if (
+                qdrant_url.scheme not in {"http", "https"}
+                or not qdrant_url.netloc
+                or qdrant_url.query
+                or qdrant_url.fragment
+            ):
+                raise ValueError("QDRANT_URL must be an HTTP(S) base URL.")
         return settings
 
     # Prevent an accidentally public API or unconfigured production model from starting.
@@ -177,6 +192,8 @@ class Settings:
             raise ValueError("OIDC_AUDIENCE is required when OIDC authentication is enabled.")
         if self.app_env == "production" and not self.database_url:
             raise ValueError("DATABASE_URL is required when APP_ENV=production.")
+        if self.app_env == "production" and not self.qdrant_url:
+            raise ValueError("QDRANT_URL is required when APP_ENV=production.")
         if (
             self.app_env == "production"
             and self.database_url

@@ -16,6 +16,335 @@ from rag_pipeline.retrieval import HybridRetriever, reciprocal_rank_fusion
 from rag_pipeline.storage import KnowledgeBase
 
 
+def test_production_configuration_requires_qdrant_url(monkeypatch):
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("OIDC_ISSUER_URL", "https://identity.example.test/realms/rag")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://user:pass@db.example.test/rag")
+    monkeypatch.setenv(
+        "USER_KEY_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii")
+    )
+    monkeypatch.setenv("WEB_BASE_URL", "https://app.example.test")
+    monkeypatch.setenv("CORS_ORIGINS", "https://app.example.test")
+    monkeypatch.setenv("QDRANT_URL", "")
+
+    settings = Settings.from_env()
+
+    with pytest.raises(ValueError, match="QDRANT_URL"):
+        settings.validate_production()
+
+
+def test_vector_store_creates_collection_and_acl_payload_indexes():
+    from types import SimpleNamespace
+
+    from qdrant_client import models
+
+    from rag_pipeline.vector_store import VectorStore
+
+    class FakeQdrantClient:
+        def __init__(self):
+            self.collection = None
+            self.indexed_fields = {}
+
+        def collection_exists(self, collection_name):
+            return self.collection is not None
+
+        def create_collection(
+            self, collection_name, vectors_config, on_disk_payload
+        ):
+            self.collection = SimpleNamespace(
+                config=SimpleNamespace(
+                    params=SimpleNamespace(vectors=vectors_config)
+                ),
+                payload_schema=self.indexed_fields,
+            )
+
+        def create_payload_index(
+            self, collection_name, field_name, field_schema
+        ):
+            self.indexed_fields[field_name] = SimpleNamespace(data_type=field_schema)
+
+        def get_collection(self, collection_name):
+            return self.collection
+
+        def close(self):
+            pass
+
+    client = FakeQdrantClient()
+    store = VectorStore(
+        "http://qdrant.example.test:6333",
+        collection_name="workspace-test",
+        vector_size=3,
+        client=client,
+    )
+    store.ensure_collection()
+    collection = client.get_collection("workspace-test")
+
+    assert collection.config.params.vectors.size == 3
+    assert {
+        "workspace_id",
+        "owner_id",
+        "required_roles",
+    } <= set(collection.payload_schema)
+    assert all(
+        collection.payload_schema[field].data_type == models.PayloadSchemaType.KEYWORD
+        for field in ("workspace_id", "owner_id", "required_roles")
+    )
+    store.check()
+
+
+def test_api_creates_and_closes_vector_store_with_application_lifespan():
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from rag_pipeline.api import create_app
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        qdrant_url="http://qdrant.example.test:6333",
+    )
+
+    class FakeVectorStore:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    store = FakeVectorStore()
+    with patch("rag_pipeline.api.VectorStore", return_value=store) as factory:
+        app = create_app(settings=settings)
+        factory.assert_not_called()
+        with TestClient(app):
+            factory.assert_called_once_with(
+                settings.qdrant_url,
+                vector_size=settings.qdrant_vector_size,
+            )
+            assert app.state.vector_store is store
+
+    assert store.closed
+
+
+@pytest.mark.filterwarnings("ignore:Payload indexes have no effect.*:UserWarning")
+def test_vector_store_search_applies_workspace_owner_and_role_filters():
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import PointStruct
+    from uuid import uuid4
+
+    from rag_pipeline.models import WorkspaceAccessContext
+    from rag_pipeline.vector_store import VectorStore
+
+    client = QdrantClient(":memory:")
+    store = VectorStore(
+        "http://qdrant.example.test:6333",
+        collection_name="workspace-acl-test",
+        vector_size=3,
+        client=client,
+    )
+    chunks = [
+        Chunk(
+            chunk_id="owner-chunk",
+            text="owner-visible",
+            source="same.md",
+            source_sha256="a" * 64,
+            chunk_index=0,
+            chunking_strategy="recursive",
+            character_count=13,
+            workspace_id="workspace-a",
+            owner_id="alice",
+            required_roles=["hr"],
+        ),
+        Chunk(
+            chunk_id="role-chunk",
+            text="role-visible",
+            source="same.md",
+            source_sha256="b" * 64,
+            chunk_index=0,
+            chunking_strategy="recursive",
+            character_count=12,
+            workspace_id="workspace-a",
+            owner_id="bob",
+            required_roles=["employee"],
+        ),
+        Chunk(
+            chunk_id="other-workspace-chunk",
+            text="other-workspace",
+            source="same.md",
+            source_sha256="c" * 64,
+            chunk_index=0,
+            chunking_strategy="recursive",
+            character_count=15,
+            workspace_id="workspace-b",
+            owner_id="alice",
+            required_roles=["employee"],
+        ),
+    ]
+    store.upsert(chunks, np.asarray([[1, 0, 0]] * len(chunks), dtype=np.float32))
+    client.upsert(
+        collection_name="workspace-acl-test",
+        points=[
+            PointStruct(
+                id=str(uuid4()),
+                vector=[1, 0, 0],
+                payload={"chunk_id": "missing-workspace", "owner_id": "alice"},
+            )
+        ],
+    )
+
+    results = store.search(
+        np.asarray([1, 0, 0], dtype=np.float32),
+        WorkspaceAccessContext(
+            user_id="alice",
+            workspace_id="workspace-a",
+            roles=frozenset({"employee"}),
+        ),
+        limit=10,
+    )
+
+    assert {item.chunk.chunk_id for item in results} == {
+        "owner-chunk",
+        "role-chunk",
+    }
+    store.close()
+
+
+@pytest.mark.filterwarnings("ignore:Payload indexes have no effect.*:UserWarning")
+@pytest.mark.filterwarnings("ignore:Payload indexes have no effect.*:UserWarning")
+def test_vector_store_rejects_malformed_acl_metadata_from_qdrant(monkeypatch):
+    from types import SimpleNamespace
+
+    from qdrant_client import QdrantClient
+
+    from rag_pipeline.models import WorkspaceAccessContext
+    from rag_pipeline.vector_store import VectorStore
+
+    client = QdrantClient(":memory:")
+    store = VectorStore(
+        "http://qdrant.example.test:6333",
+        collection_name="workspace-malformed-acl-test",
+        vector_size=3,
+        client=client,
+    )
+    store.ensure_collection()
+    monkeypatch.setattr(
+        client,
+        "query_points",
+        lambda **_kwargs: SimpleNamespace(
+            points=[
+                SimpleNamespace(
+                    payload={"owner_id": "alice", "required_roles": []},
+                    score=1.0,
+                )
+            ]
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="malformed document ACL metadata"):
+        store.search(
+            np.asarray([1, 0, 0], dtype=np.float32),
+            WorkspaceAccessContext(
+                user_id="alice",
+                workspace_id="workspace-a",
+                roles=frozenset(),
+            ),
+            limit=1,
+        )
+
+    store.close()
+
+
+def test_vector_store_reports_qdrant_unavailable():
+    from qdrant_client.http.exceptions import ResponseHandlingException
+
+    from rag_pipeline.vector_store import VectorStore
+
+    class UnavailableQdrantClient:
+        def collection_exists(self, collection_name):
+            raise ResponseHandlingException("Qdrant is offline.")
+
+        def close(self):
+            pass
+
+    store = VectorStore(
+        "http://qdrant.example.test:6333",
+        vector_size=3,
+        client=UnavailableQdrantClient(),
+    )
+
+    with pytest.raises(RuntimeError, match="Qdrant collection is unavailable"):
+        store.check()
+
+
+def test_vector_store_readiness_does_not_create_a_missing_collection():
+    from qdrant_client import QdrantClient
+
+    from rag_pipeline.vector_store import VectorStore
+
+    client = QdrantClient(":memory:")
+    store = VectorStore(
+        "http://qdrant.example.test:6333",
+        collection_name="missing-collection-test",
+        vector_size=3,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="Qdrant collection is unavailable"):
+        store.check()
+
+    assert not client.collection_exists("missing-collection-test")
+    store.close()
+
+
+def test_vector_store_delete_document_is_workspace_scoped():
+    from qdrant_client import QdrantClient
+
+    from rag_pipeline.models import WorkspaceAccessContext
+    from rag_pipeline.vector_store import VectorStore
+
+    client = QdrantClient(":memory:")
+    store = VectorStore(
+        "http://qdrant.example.test:6333",
+        collection_name="workspace-delete-test",
+        vector_size=3,
+        client=client,
+    )
+    chunks = [
+        Chunk(
+            chunk_id=f"chunk-{workspace_id}",
+            text="shared filename",
+            source="same.md",
+            source_sha256=source_digest,
+            chunk_index=0,
+            chunking_strategy="recursive",
+            character_count=16,
+            workspace_id=workspace_id,
+            owner_id="alice",
+        )
+        for workspace_id, source_digest in (
+            ("workspace-a", "a" * 64),
+            ("workspace-b", "b" * 64),
+        )
+    ]
+    store.upsert(chunks, np.asarray([[1, 0, 0]] * 2, dtype=np.float32))
+
+    store.delete_document("workspace-a", "same.md")
+    remaining = store.search(
+        np.asarray([1, 0, 0], dtype=np.float32),
+        WorkspaceAccessContext(
+            user_id="alice",
+            workspace_id="workspace-b",
+            roles=frozenset(),
+        ),
+        limit=10,
+    )
+
+    assert [item.chunk.chunk_id for item in remaining] == ["chunk-workspace-b"]
+    store.close()
+
+
 # Provide deterministic local embeddings for tests without external API credentials.
 class FakeEmbeddings:
     # Create reproducible normalized vectors from stable text hashes.
@@ -369,6 +698,7 @@ def test_production_api_authentication():
         app_env="production",
         web_base_url="https://app.example.test",
         api_key=None,
+        qdrant_url="http://qdrant.example.test:6333",
         oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
         openai_api_key="test-openai-key",
         database_url="postgresql+psycopg://user:password@localhost/test",
@@ -778,6 +1108,7 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
         app_env="production",
         web_base_url="https://app.example.test",
         api_key=None,
+        qdrant_url="http://qdrant.example.test:6333",
         oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
         openai_api_key=None,
         database_url="postgresql+psycopg://user:password@localhost/test",

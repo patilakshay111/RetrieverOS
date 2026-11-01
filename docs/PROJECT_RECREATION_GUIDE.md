@@ -169,6 +169,10 @@ checkpoints, the React/Vite dashboard, OpenTelemetry, Kubernetes, and
 deployment automation remain future work. Workspace authorization,
 invitation endpoints, and privileged-access auditing are implemented; the
 Streamlit dashboard does not yet expose their full management workflows.
+For native local development, leave `QDRANT_URL` blank; Compose configures its
+internal Qdrant endpoint. The API manages the configured Qdrant client with its
+application lifespan, while dense retrieval is still on the durable-RAG task
+list. `QDRANT_VECTOR_SIZE` defaults to 1536 and must match the embedding model.
 
 For a short demo, ingest a new runbook, ask a direct lookup, ask a multi-hop
 question, ask something absent from the corpus, then compare hybrid and

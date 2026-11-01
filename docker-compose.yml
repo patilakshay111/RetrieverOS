@@ -12,6 +12,8 @@ services:
       OIDC_JWKS_URL: ${OIDC_JWKS_URL:-}
       OIDC_AUDIENCE: ${OIDC_AUDIENCE:-hybrid-rag-api}
       DATABASE_URL: ${DATABASE_URL:-}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1536}
       USER_KEY_ENCRYPTION_KEY: ${USER_KEY_ENCRYPTION_KEY:?Run scripts/init_local_env.py to generate local secrets}
       DATA_DIR: /app/data/runtime
       RERANKER_ENABLED: ${RERANKER_ENABLED:-true}

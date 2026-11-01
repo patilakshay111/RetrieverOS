@@ -48,11 +48,11 @@ interfaces and conversation routes depend on its authenticated workspace scope.
 - Produces: `VectorStore.upsert(chunks: Sequence[Chunk], vectors: np.ndarray) -> None`, `VectorStore.search(vector: np.ndarray, scope: WorkspaceAccessContext, limit: int) -> list[RetrievedChunk]`, `VectorStore.delete_document(workspace_id: str, source_id: str) -> None`, and `VectorStore.check() -> None`.
 - `scope` is the server-derived `WorkspaceAccessContext` from the workspace authorization plan.
 
-- [ ] **Step 1: Write failing configuration/client tests** for required production `QDRANT_URL`, collection readiness, exact ACL filters, and Qdrant failure status.
-- [ ] **Step 2: Run** `python -m pytest tests/test_core.py -k qdrant`; confirm failures.
-- [ ] **Step 3: Implement** one managed Qdrant client and collection schema with keyword payload indexes for `workspace_id`, `owner_id`, and `required_roles`; use exact points rather than in-process vector copies for production search.
-- [ ] **Step 4: Run** focused tests with a local Qdrant fixture or deterministic fake and verify Compose config.
-- [ ] **Step 5: Commit** client, configuration, Compose, and tests.
+- [x] **Step 1: Write failing configuration/client tests** for required production `QDRANT_URL`, collection readiness, exact ACL filters, and Qdrant failure status.
+- [x] **Step 2: Run** `python -m pytest tests/test_core.py -k qdrant`; confirm failures.
+- [x] **Step 3: Implement** one managed Qdrant client and collection schema with keyword payload indexes for `workspace_id`, `owner_id`, and `required_roles`; use exact points rather than in-process vector copies for production search.
+- [x] **Step 4: Run** focused tests with a local Qdrant fixture or deterministic fake and verify Compose config.
+- [x] **Step 5: Commit** client, configuration, Compose, and tests.
 
 ### Task 2: Route ingestion and hybrid retrieval through Qdrant
 

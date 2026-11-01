@@ -1,6 +1,8 @@
 # api.py: exposes authenticated FastAPI endpoints for ingestion, retrieval, and grounded answers
 
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -29,6 +31,7 @@ from rag_pipeline.models import (
     WorkspaceAccessContext,
 )
 from rag_pipeline.service import RAGService
+from rag_pipeline.vector_store import VectorStore
 from rag_pipeline.workspaces import create_workspace_router
 
 
@@ -181,11 +184,31 @@ class OpenAIKeyRequest(BaseModel):
 def create_app(settings: Settings | None = None, service: RAGService | None = None) -> FastAPI:
     configured = settings or Settings.from_env()
     configured.validate_production()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        vector_store = (
+            VectorStore(
+                configured.qdrant_url,
+                vector_size=configured.qdrant_vector_size,
+            )
+            if configured.qdrant_url
+            else None
+        )
+        app.state.vector_store = vector_store
+        try:
+            yield
+        finally:
+            if vector_store is not None:
+                vector_store.close()
+
     app = FastAPI(
         title="Internal Docs Hybrid RAG",
         version="1.0.0",
         description="Hybrid retrieval with grounded answers, citation verification, and confidence scoring.",
+        lifespan=lifespan,
     )
+    app.state.vector_store = None
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(configured.cors_origins),

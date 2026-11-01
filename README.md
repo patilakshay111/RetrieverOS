@@ -170,6 +170,10 @@ notepad .env
 ```
 
 In `.env`, set `OPENAI_API_KEY` to your real OpenAI API key. Keep `APP_ENV=development` for local use. `API_KEY` can remain blank for a local-only demo; if you set it, send the same value as `X-API-Key` when calling protected endpoints. Do not commit `.env`.
+For native local development, leave `QDRANT_URL` blank; Docker Compose
+configures its internal Qdrant service automatically. Production requires
+`QDRANT_URL`. `QDRANT_VECTOR_SIZE` defaults to 1536 for the default
+`text-embedding-3-small` model and must match the configured embedding model.
 For this native-Python setup (not Docker Compose), set SQLite as the local
 credential store in the API terminal before starting it:
 
