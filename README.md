@@ -170,8 +170,8 @@ flowchart TD
 %%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
 flowchart TD
     client["Streamlit or API client"] --> ask["POST /v1/ask"]
-    ask --> graph["RAGService / LangGraph<br/>load thread history"]
-    graph --> query["Build query from question<br/>and recent history"]
+    ask --> workflow["RAGService / LangGraph<br/>load thread history"]
+    workflow --> query["Build query from question<br/>and recent history"]
     query --> retrieve["Retrieve evidence<br/>FAISS, BM25, or hybrid RRF"]
     retrieve --> rerank["Optional cross-encoder reranking"]
     rerank --> gate{"Retrieval confidence<br/>below threshold?"}
