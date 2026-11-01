@@ -6,7 +6,7 @@ from functools import cached_property
 import jwt
 
 from rag_pipeline.config import Settings
-from rag_pipeline.models import AccessContext
+from rag_pipeline.models import VerifiedIdentity
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class OIDCVerifier:
             timeout=5,
         )
 
-    def verify(self, token: str) -> AccessContext:
+    def verify(self, token: str) -> VerifiedIdentity:
         signing_key = self.jwks.get_signing_key_from_jwt(token)
         claims = jwt.decode(
             token,
@@ -37,23 +37,18 @@ class OIDCVerifier:
             leeway=30,
         )
         subject = claims["sub"]
-        workspace_id = claims.get("workspace_id", f"personal:{subject}")
-        if not isinstance(workspace_id, str) or not workspace_id.strip():
-            raise jwt.InvalidTokenError("The token contains an invalid workspace_id claim.")
+        if not isinstance(subject, str) or not subject.strip() or len(subject) > 255:
+            raise jwt.InvalidTokenError("The token contains an invalid subject claim.")
         realm_access = claims.get("realm_access")
         realm_roles = realm_access.get("roles", []) if isinstance(realm_access, dict) else []
         if not isinstance(realm_roles, list):
             realm_roles = []
-        roles = claims.get("roles", realm_roles)
-        if not isinstance(roles, list) or not all(
-            isinstance(role, str) and role.strip() for role in roles
-        ):
-            raise jwt.InvalidTokenError("The token contains an invalid roles claim.")
-        return AccessContext(
+        return VerifiedIdentity(
             user_id=subject,
-            workspace_id=workspace_id,
-            roles=frozenset(roles),
-            platform_admin="platform-admin" in realm_roles,
+            platform_admin=any(
+                isinstance(role, str) and role == "platform-admin"
+                for role in realm_roles
+            ),
         )
 
 

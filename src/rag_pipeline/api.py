@@ -4,7 +4,7 @@ import secrets
 from typing import Annotated, Literal
 
 import jwt
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -18,7 +18,14 @@ from rag_pipeline.config import Settings
 from rag_pipeline.auth import OIDCVerifier, build_oidc_verifier
 from rag_pipeline.credentials import UserCredentialStore
 from rag_pipeline.embeddings import OpenAIEmbeddingProvider
-from rag_pipeline.models import AccessContext, AnswerResponse, DocumentInfo, IngestionResult
+from rag_pipeline.identity_store import WorkspaceStore
+from rag_pipeline.models import (
+    AnswerResponse,
+    DocumentInfo,
+    IngestionResult,
+    VerifiedIdentity,
+    WorkspaceAccessContext,
+)
 from rag_pipeline.service import RAGService
 
 
@@ -159,8 +166,13 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
         CORSMiddleware,
         allow_origins=list(configured.cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-API-Key",
+            "X-Workspace-ID",
+        ],
     )
     app.add_middleware(
         RequestBodyLimitMiddleware,
@@ -179,6 +191,9 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
         if configured.database_url and configured.user_key_encryption_key
         else None
     )
+    workspace_store = (
+        WorkspaceStore(configured.database_url) if configured.database_url else None
+    )
 
     # Authenticate a signed Keycloak identity, retaining API-key mode only for local use.
     def authorize(
@@ -186,21 +201,74 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
         credentials: Annotated[
             HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
         ],
-    ) -> AccessContext:
+        workspace_id: Annotated[
+            str | None, Header(alias="X-Workspace-ID", max_length=512)
+        ] = None,
+    ) -> WorkspaceAccessContext:
         if oidc_verifier is not None:
             if credentials is None or credentials.scheme.casefold() != "bearer":
                 raise HTTPException(status_code=401, detail="A valid bearer token is required.")
             try:
-                return oidc_verifier.verify(credentials.credentials)
+                identity: VerifiedIdentity = oidc_verifier.verify(credentials.credentials)
             except (jwt.PyJWTError, OSError, ValueError) as error:
                 raise HTTPException(status_code=401, detail="The bearer token is invalid.") from error
+            if workspace_store is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Workspace membership storage is not configured.",
+                )
+            try:
+                personal_membership = workspace_store.create_personal_workspace(
+                    identity.user_id
+                )
+                if workspace_id is not None and not workspace_id.strip():
+                    raise HTTPException(
+                        status_code=422,
+                        detail="X-Workspace-ID must not be empty.",
+                    )
+                selected_workspace_id = (
+                    workspace_id
+                    if workspace_id is not None
+                    else personal_membership.workspace_id
+                )
+                workspace = workspace_store.get_workspace(selected_workspace_id)
+                if workspace is None:
+                    raise HTTPException(
+                        status_code=403, detail="The selected workspace is not available."
+                    )
+                membership = workspace_store.get_membership(
+                    identity.user_id, selected_workspace_id
+                )
+                if not identity.platform_admin and (
+                    membership is None or membership.status != "active"
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="You are not an active member of the selected workspace.",
+                    )
+                roles = (
+                    membership.roles
+                    if membership is not None and membership.status == "active"
+                    else frozenset()
+                )
+                return WorkspaceAccessContext(
+                    user_id=identity.user_id,
+                    workspace_id=selected_workspace_id,
+                    roles=roles,
+                    platform_admin=identity.platform_admin,
+                )
+            except SQLAlchemyError as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Unable to resolve workspace membership.",
+                ) from error
         if configured.app_env == "production":
             raise HTTPException(status_code=503, detail="OIDC authentication is not configured.")
         if configured.api_key and (
             api_key is None or not secrets.compare_digest(api_key, configured.api_key)
         ):
             raise HTTPException(status_code=401, detail="A valid X-API-Key header is required.")
-        return AccessContext(
+        return WorkspaceAccessContext(
             user_id="local",
             workspace_id="local",
             roles=frozenset({"admin"}),
@@ -218,7 +286,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
         return runtime
 
     # Resolve a user's private OpenAI key without exposing it through the API.
-    def get_user_openai_key(access_context: AccessContext) -> str:
+    def get_user_openai_key(access_context: WorkspaceAccessContext) -> str:
         if oidc_verifier is not None:
             if credential_store is None:
                 raise HTTPException(
@@ -264,7 +332,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     # Store only an authenticated user's own encrypted model credential.
     @app.get("/v1/account/openai-key")
     def openai_key_status(
-        access_context: Annotated[AccessContext, Depends(authorize)],
+        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
     ) -> dict[str, bool]:
         if credential_store is None:
             raise HTTPException(
@@ -284,7 +352,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     @app.put("/v1/account/openai-key", status_code=204)
     def save_openai_key(
         request: OpenAIKeyRequest,
-        access_context: Annotated[AccessContext, Depends(authorize)],
+        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
     ) -> None:
         if credential_store is None:
             raise HTTPException(
@@ -303,7 +371,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
 
     @app.delete("/v1/account/openai-key", status_code=204)
     def delete_openai_key(
-        access_context: Annotated[AccessContext, Depends(authorize)],
+        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
     ) -> None:
         if credential_store is None:
             raise HTTPException(
@@ -341,7 +409,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     # Return the current indexed-document inventory.
     @app.get("/v1/documents", response_model=list[DocumentInfo])
     def documents(
-        access_context: Annotated[AccessContext, Depends(authorize)],
+        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
     ) -> list[DocumentInfo]:
         try:
             return get_runtime().knowledge_base.list_documents(access_context)
@@ -354,7 +422,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     @app.post("/v1/ingest", response_model=IngestionResult)
     async def ingest(
         file: Annotated[UploadFile, File()],
-        access_context: Annotated[AccessContext, Depends(authorize)],
+        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
         strategy: Annotated[Literal["fixed", "recursive", "semantic"], Form()] = "recursive",
         roles: Annotated[str, Form()] = "employee",
     ) -> IngestionResult:
@@ -399,7 +467,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     )
     async def ask(
         request: AskRequest,
-        access_context: Annotated[AccessContext, Depends(authorize)],
+        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
     ) -> AnswerResponse:
         try:
             user_api_key = get_user_openai_key(access_context)
@@ -423,7 +491,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     )
     async def compare(
         request: AskRequest,
-        access_context: Annotated[AccessContext, Depends(authorize)],
+        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
     ) -> dict[str, AnswerResponse]:
         runtime_service = get_runtime()
         try:

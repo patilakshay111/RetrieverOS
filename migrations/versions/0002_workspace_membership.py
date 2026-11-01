@@ -15,7 +15,7 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.create_table(
         "workspaces",
-        sa.Column("id", sa.String(length=36), nullable=False),
+        sa.Column("id", sa.String(length=512), nullable=False),
         sa.Column("name", sa.String(length=255), nullable=False),
         sa.Column("personal_owner_id", sa.String(length=255), nullable=True),
         sa.Column(
@@ -46,7 +46,7 @@ def upgrade() -> None:
     op.create_table(
         "workspace_memberships",
         sa.Column("user_id", sa.String(length=255), nullable=False),
-        sa.Column("workspace_id", sa.String(length=36), nullable=False),
+        sa.Column("workspace_id", sa.String(length=512), nullable=False),
         sa.Column("roles", sa.JSON(), nullable=False),
         sa.Column("status", sa.String(length=20), nullable=False),
         sa.Column(

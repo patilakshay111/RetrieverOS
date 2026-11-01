@@ -29,7 +29,7 @@ MEMBERSHIP_STATUSES = frozenset({"active", "suspended"})
 class Workspace(Base):
     __tablename__ = "workspaces"
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    id: Mapped[str] = mapped_column(String(512), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     personal_owner_id: Mapped[str | None] = mapped_column(
         String(255), unique=True, nullable=True
@@ -59,7 +59,7 @@ class WorkspaceMembership(Base):
 
     user_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+        String(512), ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
     )
     roles: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
@@ -151,7 +151,7 @@ class WorkspaceStore:
                 )
                 if workspace is None:
                     workspace = Workspace(
-                        id=str(uuid4()),
+                        id=f"personal:{user_id}",
                         name="Personal workspace",
                         personal_owner_id=user_id,
                     )
@@ -248,6 +248,13 @@ class WorkspaceStore:
             if membership is None:
                 return None
             return self._membership_record(membership)
+
+    def get_workspace(self, workspace_id: str) -> WorkspaceRecord | None:
+        with Session(self._engine) as session:
+            workspace = session.get(Workspace, workspace_id)
+            if workspace is None:
+                return None
+            return self._workspace_record(workspace)
 
     def set_membership_status(
         self, user_id: str, workspace_id: str, status: str

@@ -377,7 +377,10 @@ def test_production_api_authentication():
         knowledge_base=SimpleNamespace(list_documents=lambda _access_context=None: [])
     )
     fake_store = SimpleNamespace(check=lambda: None)
-    with patch("rag_pipeline.api.UserCredentialStore", return_value=fake_store):
+    with (
+        patch("rag_pipeline.api.UserCredentialStore", return_value=fake_store),
+        patch("rag_pipeline.api.WorkspaceStore", return_value=fake_store),
+    ):
         client = TestClient(create_app(settings=settings, service=fake_service))
     assert client.get("/healthz").status_code == 200
     assert client.get("/v1/documents").status_code == 401
@@ -396,7 +399,7 @@ def test_production_api_authentication():
     assert oversized.status_code == 413
 
 
-# Verify Keycloak tokens are checked cryptographically and yield only signed access claims.
+# Verify Keycloak tokens yield identity and platform-admin status, not workspace roles.
 def test_oidc_verifier_validates_signature_issuer_audience_and_access_claims():
     from datetime import datetime, timedelta, timezone
 
@@ -404,6 +407,7 @@ def test_oidc_verifier_validates_signature_issuer_audience_and_access_claims():
     from cryptography.hazmat.primitives.asymmetric import rsa
 
     from rag_pipeline.auth import OIDCVerifier
+    from rag_pipeline.models import VerifiedIdentity
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     issuer = "https://identity.example.test/realms/hybrid-rag"
@@ -433,10 +437,9 @@ def test_oidc_verifier_validates_signature_issuer_audience_and_access_claims():
 
     context = verifier.verify(token)
 
-    assert context.user_id == "user-123"
-    assert context.workspace_id == "workspace-abc"
-    assert context.roles == {"hr"}
-    assert context.platform_admin
+    assert context == VerifiedIdentity(user_id="user-123", platform_admin=True)
+    assert not hasattr(context, "workspace_id")
+    assert not hasattr(context, "roles")
 
     claims["aud"] = "different-api"
     invalid_token = jwt.encode(claims, private_key, algorithm="RS256")
@@ -574,10 +577,111 @@ def test_workspace_membership_schema_migration(tmp_path, monkeypatch):
     command.upgrade(Config("alembic.ini"), "head")
 
     engine = create_engine(f"sqlite:///{database_path.as_posix()}")
-    tables = set(inspect(engine).get_table_names())
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    workspace_id = next(
+        column["type"].length
+        for column in inspector.get_columns("workspaces")
+        if column["name"] == "id"
+    )
+    membership_workspace_id = next(
+        column["type"].length
+        for column in inspector.get_columns("workspace_memberships")
+        if column["name"] == "workspace_id"
+    )
     engine.dispose()
 
     assert {"workspaces", "workspace_memberships", "role_definitions"} <= tables
+    assert workspace_id == 512
+    assert membership_workspace_id == 512
+
+
+def test_workspace_scope_uses_current_membership_not_token_claims(tmp_path):
+    from cryptography.fernet import Fernet
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+    from rag_pipeline.identity_store import WorkspaceStore
+    from rag_pipeline.models import VerifiedIdentity
+
+    database_url = f"sqlite:///{(tmp_path / 'workspace-scope.sqlite').as_posix()}"
+    seed_store = WorkspaceStore(database_url)
+    personal = seed_store.create_personal_workspace("alice")
+    shared = seed_store.create_workspace("Shared workspace")
+    other_personal = seed_store.create_personal_workspace("bob")
+    seed_store.add_membership("alice", shared.id, roles={"hr"})
+
+    class StaticVerifier:
+        def verify(self, token: str) -> VerifiedIdentity:
+            return VerifiedIdentity(
+                user_id=token.removesuffix("-token"),
+                platform_admin=token == "platform-admin",
+            )
+
+    seen_contexts = []
+
+    def list_documents(access_context):
+        seen_contexts.append(access_context)
+        return []
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        api_key=None,
+        oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
+        database_url=database_url,
+        user_key_encryption_key=Fernet.generate_key().decode("ascii"),
+    )
+    fake_service = SimpleNamespace(
+        knowledge_base=SimpleNamespace(list_documents=list_documents)
+    )
+    with patch("rag_pipeline.api.build_oidc_verifier", return_value=StaticVerifier()):
+        client = TestClient(create_app(settings=settings, service=fake_service))
+
+    preflight = client.options(
+        "/v1/account/openai-key",
+        headers={
+            "Origin": "http://localhost:8501",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "authorization,content-type,x-workspace-id",
+        },
+    )
+    assert preflight.status_code == 200
+    assert "x-workspace-id" in preflight.headers["access-control-allow-headers"].lower()
+
+    assert personal.workspace_id == "personal:alice"
+    alice = {"Authorization": "Bearer alice-token"}
+    assert client.get("/v1/documents", headers=alice).status_code == 200
+    assert seen_contexts[-1].workspace_id == personal.workspace_id
+    assert seen_contexts[-1].roles == frozenset({"admin"})
+
+    shared_headers = {**alice, "X-Workspace-ID": shared.id}
+    assert client.get("/v1/documents", headers=shared_headers).status_code == 200
+    assert seen_contexts[-1].roles == frozenset({"hr"})
+
+    seed_store.add_membership("alice", shared.id, roles={"employee"})
+    assert client.get("/v1/documents", headers=shared_headers).status_code == 200
+    assert seen_contexts[-1].roles == frozenset({"employee"})
+
+    assert client.get(
+        "/v1/documents", headers={**alice, "X-Workspace-ID": "unknown-workspace"}
+    ).status_code == 403
+    assert client.get(
+        "/v1/documents", headers={**alice, "X-Workspace-ID": ""}
+    ).status_code == 422
+    assert client.get(
+        "/v1/documents",
+        headers={**alice, "X-Workspace-ID": other_personal.workspace_id},
+    ).status_code == 403
+
+    platform_headers = {
+        "Authorization": "Bearer platform-admin",
+        "X-Workspace-ID": shared.id,
+    }
+    assert client.get("/v1/documents", headers=platform_headers).status_code == 200
+    assert seen_contexts[-1].platform_admin
 
 
 # Verify the account API can save, report, and delete a user's encrypted key.
@@ -613,21 +717,21 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
 
     from rag_pipeline.api import create_app
     from rag_pipeline.credentials import UserCredentialStore
-    from rag_pipeline.models import AccessContext, AnswerResponse
+    from rag_pipeline.identity_store import WorkspaceStore
+    from rag_pipeline.models import AnswerResponse, VerifiedIdentity
 
     encryption_key = Fernet.generate_key().decode("ascii")
     store = UserCredentialStore("sqlite:///:memory:", encryption_key)
+    workspace_store = WorkspaceStore("sqlite:///:memory:")
+    workspace_store.create_personal_workspace("alice")
+    workspace_store.create_personal_workspace("bob")
     identities = {
-        "alice-token": AccessContext(
-            user_id="alice", workspace_id="workspace-a", roles=frozenset({"employee"})
-        ),
-        "bob-token": AccessContext(
-            user_id="bob", workspace_id="workspace-a", roles=frozenset({"employee"})
-        ),
+        "alice-token": VerifiedIdentity(user_id="alice"),
+        "bob-token": VerifiedIdentity(user_id="bob"),
     }
 
     class StaticVerifier:
-        def verify(self, token: str) -> AccessContext:
+        def verify(self, token: str) -> VerifiedIdentity:
             return identities[token]
 
     used_keys: list[str] = []
@@ -636,7 +740,7 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
         question: str,
         retrieval_mode: str,
         thread_id: str,
-        _access_context: AccessContext,
+        _access_context,
         api_key: str,
     ) -> AnswerResponse:
         used_keys.append(api_key)
@@ -666,6 +770,7 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
     with (
         patch("rag_pipeline.api.build_oidc_verifier", return_value=StaticVerifier()),
         patch("rag_pipeline.api.UserCredentialStore", return_value=store),
+        patch("rag_pipeline.api.WorkspaceStore", return_value=workspace_store),
     ):
         client = TestClient(create_app(settings=settings, service=fake_service))
 
@@ -685,7 +790,7 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
 
     assert response.status_code == 200
     assert used_keys == [alice_key]
-    assert store.get_key("bob", "workspace-a") is None
+    assert store.get_key("bob", "personal:bob") is None
 
 
 # Verify a per-user key is supplied to both embedding and answer-generation clients.

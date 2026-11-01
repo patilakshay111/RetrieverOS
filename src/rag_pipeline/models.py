@@ -21,6 +21,15 @@ class AccessContext(BaseModel):
         return bool(self.roles.intersection(required_roles))
 
 
+class VerifiedIdentity(BaseModel):
+    user_id: str = Field(min_length=1, max_length=255)
+    platform_admin: bool = False
+
+
+class WorkspaceAccessContext(AccessContext):
+    pass
+
+
 # Append new checkpoint history while retaining only the most recent 20 exchanges.
 def merge_history(previous: list[str], update: list[str]) -> list[str]:
     return (previous + update)[-40:]
