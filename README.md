@@ -190,7 +190,7 @@ flowchart TD
     classDef provider fill:#1b263b,stroke:#06d6a0,color:#ffffff;
 
     class client,response client;
-    class ask,graph,query,retrieve,rerank,abstain,score service;
+    class ask,workflow,query,retrieve,rerank,abstain,score service;
     class gate decision;
     class answer,citations,completeness provider;
 ```
