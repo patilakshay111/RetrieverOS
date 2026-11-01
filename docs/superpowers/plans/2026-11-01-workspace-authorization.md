@@ -110,10 +110,10 @@ server-derived workspace scope and membership API.
 **Interfaces:**
 - Produces: append-only `AuditEvent` records with actor subject, action, workspace target, timestamp, and request correlation ID; exclude prompt/document/answer/key/token values.
 
-- [ ] **Step 1: Write failing tests** asserting every platform-admin cross-workspace API access (document list, ingest, ask/compare, member/role operations) writes an audit event; same-workspace access does not create a false cross-workspace event; event records contain no sensitive content.
-- [ ] **Step 2: Run** `python -m pytest tests/test_core.py -k audit`; confirm it fails.
-- [ ] **Step 3: Implement** the audit repository and write events in every cross-workspace request path, including reads and RAG operations, not only admin mutations.
-- [ ] **Step 4: Run** focused audit and authorization tests; verify audit rows survive repository recreation.
+- [x] **Step 1: Write failing tests** asserting every platform-admin cross-workspace API access (document list, ingest, ask/compare, member/role operations) writes an audit event; same-workspace access does not create a false cross-workspace event; event records contain no sensitive content.
+- [x] **Step 2: Run** focused audit tests; confirm they fail before request IDs and audit event persistence are implemented.
+- [x] **Step 3: Implement** the audit repository and write events in every cross-workspace request path, including reads and RAG operations, not only admin mutations.
+- [x] **Step 4: Run** focused audit and authorization tests; verify persisted audit rows through a separate database connection.
 - [ ] **Step 5: Commit** audit migration, service, and tests.
 
 ### Task 5: Verify the authorization API contract

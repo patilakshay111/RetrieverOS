@@ -5,6 +5,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from rag_pipeline.credentials import Base
+import rag_pipeline.audit  # Register audit-event tables with shared metadata.
 import rag_pipeline.identity_store  # Register workspace tables with shared metadata.
 
 

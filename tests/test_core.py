@@ -606,6 +606,7 @@ def test_workspace_membership_schema_migration(tmp_path, monkeypatch):
         "workspace_memberships",
         "role_definitions",
         "workspace_invitations",
+        "admin_audit_events",
     } <= tables
     assert workspace_id == 512
     assert membership_workspace_id == 512
@@ -868,6 +869,123 @@ def test_graph_clients_are_built_with_the_callers_key(monkeypatch):
     assert received_generation_keys == ["alice-openai-key", "bob-openai-key"]
 
 
+def test_platform_admin_cross_workspace_requests_are_audited(workspace_api):
+    from sqlalchemy import create_engine, inspect, text
+
+    client = workspace_api.client
+    headers = {
+        "Authorization": "Bearer platform-token",
+        "X-Workspace-ID": workspace_api.shared_workspace_id,
+    }
+    responses = [
+        client.get("/v1/documents", headers=headers),
+        client.post(
+            "/v1/ingest",
+            headers=headers,
+            files={"file": ("confidential.txt", b"private document text")},
+        ),
+        client.post(
+            "/v1/ask",
+            headers=headers,
+            json={"question": "A private question"},
+        ),
+        client.post(
+            "/v1/compare",
+            headers=headers,
+            json={"question": "A private comparison question"},
+        ),
+        client.get(
+            f"/v1/workspaces/{workspace_api.shared_workspace_id}/members",
+            headers=headers,
+        ),
+        client.get(
+            f"/v1/workspaces/{workspace_api.shared_workspace_id}/members",
+            headers={
+                "Authorization": "Bearer platform-token",
+                "X-Workspace-ID": "personal:platform",
+            },
+        ),
+        client.get("/v1/roles", headers=headers),
+        client.post(
+            "/v1/roles",
+            headers=headers,
+            json={"name": "auditor"},
+        ),
+        client.get(
+            "/v1/workspaces",
+            headers={"Authorization": "Bearer platform-token"},
+        ),
+        client.get(
+            "/v1/roles",
+            headers={"Authorization": "Bearer platform-token"},
+        ),
+    ]
+
+    assert [response.status_code for response in responses] == [
+        200,
+        428,
+        428,
+        428,
+        200,
+        200,
+        200,
+        201,
+        200,
+        200,
+    ]
+    request_ids = [response.headers.get("x-request-id") for response in responses]
+    assert all(request_ids)
+    assert len(set(request_ids)) == len(responses)
+
+    engine = create_engine(workspace_api.database_url)
+    assert "admin_audit_events" in inspect(engine).get_table_names()
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT actor_user_id, action, workspace_id, request_id "
+                "FROM admin_audit_events ORDER BY created_at, id"
+            )
+        ).all()
+    engine.dispose()
+
+    assert len(rows) == len(responses)
+    assert {row.actor_user_id for row in rows} == {"platform"}
+    assert {row.workspace_id for row in rows[:6]} == {
+        workspace_api.shared_workspace_id
+    }
+    assert all(row.workspace_id is None for row in rows[6:])
+    assert {row.request_id for row in rows} == set(request_ids)
+    assert {row.action for row in rows} == {
+        "GET /v1/documents",
+        "POST /v1/ingest",
+        "POST /v1/ask",
+        "POST /v1/compare",
+        "GET /v1/workspaces/{workspace_id}/members",
+        "GET /v1/roles",
+        "POST /v1/roles",
+        "GET /v1/workspaces",
+    }
+    assert all(
+        "private" not in row.action and "confidential" not in row.action
+        for row in rows
+    )
+
+    same_workspace = client.get(
+        "/v1/documents",
+        headers={
+            "Authorization": "Bearer platform-token",
+            "X-Workspace-ID": "personal:platform",
+        },
+    )
+    assert same_workspace.status_code == 200
+    with engine.connect() as connection:
+        audit_count = connection.execute(
+            text("SELECT count(*) FROM admin_audit_events")
+        ).scalar_one()
+    engine.dispose()
+    assert audit_count == len(responses)
+
+
 @pytest.fixture
 def workspace_api(tmp_path):
     from cryptography.fernet import Fernet
@@ -942,7 +1060,16 @@ def workspace_api(tmp_path):
         patch("rag_pipeline.api.build_oidc_verifier", return_value=StaticVerifier()),
         patch("rag_pipeline.api.WorkspaceStore", return_value=store),
         patch("rag_pipeline.workspaces.SMTPInvitationMailer", FakeMailer),
-        TestClient(create_app(settings=settings, service=SimpleNamespace())) as client,
+        TestClient(
+            create_app(
+                settings=settings,
+                service=SimpleNamespace(
+                    knowledge_base=SimpleNamespace(
+                        list_documents=lambda _access_context: []
+                    )
+                ),
+            )
+        ) as client,
     ):
         yield SimpleNamespace(
             client=client,

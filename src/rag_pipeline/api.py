@@ -2,9 +2,10 @@
 
 import secrets
 from typing import Annotated, Literal
+from uuid import uuid4
 
 import jwt
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -16,6 +17,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rag_pipeline.config import Settings
 from rag_pipeline.auth import OIDCVerifier, build_oidc_verifier
+from rag_pipeline.audit import AdminAuditStore
 from rag_pipeline.credentials import UserCredentialStore
 from rag_pipeline.embeddings import OpenAIEmbeddingProvider
 from rag_pipeline.identity_store import WorkspaceStore
@@ -38,6 +40,27 @@ bearer_scheme = HTTPBearer(auto_error=False)
 # Signal that a request exceeded the bounded ASGI body size.
 class RequestBodyTooLarge(Exception):
     pass
+
+
+class RequestIDMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request_id = str(uuid4())
+        scope.setdefault("state", {})["request_id"] = request_id
+
+        async def send_with_request_id(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append((b"x-request-id", request_id.encode("ascii")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
 
 
 # Reject oversized requests before multipart parsing can spool an unbounded upload.
@@ -174,11 +197,13 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
             "X-API-Key",
             "X-Workspace-ID",
         ],
+        expose_headers=["X-Request-ID"],
     )
     app.add_middleware(
         RequestBodyLimitMiddleware,
         max_upload_bytes=configured.max_upload_bytes,
     )
+    app.add_middleware(RequestIDMiddleware)
     runtime = service
     oidc_verifier = build_oidc_verifier(configured)
     if bool(configured.database_url) != bool(configured.user_key_encryption_key):
@@ -194,6 +219,9 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     )
     workspace_store = (
         WorkspaceStore(configured.database_url) if configured.database_url else None
+    )
+    audit_store = (
+        AdminAuditStore(configured.database_url) if configured.database_url else None
     )
 
     # Authenticate a signed Keycloak identity, retaining API-key mode only for local use.
@@ -219,6 +247,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
         return VerifiedIdentity(user_id="local", platform_admin=True)
 
     def authorize(
+        request: Request,
         identity: Annotated[VerifiedIdentity, Depends(authenticate)],
         workspace_header: Annotated[
             str | None, Header(alias="X-Workspace-ID", max_length=512)
@@ -264,7 +293,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
                     if membership is not None and membership.status == "active"
                     else frozenset()
                 )
-                return WorkspaceAccessContext(
+                access_context = WorkspaceAccessContext(
                     user_id=identity.user_id,
                     workspace_id=selected_workspace_id,
                     roles=roles,
@@ -275,6 +304,36 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
                     status_code=503,
                     detail="Unable to resolve workspace membership.",
                 ) from error
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", request.url.path)
+            global_scope = route_path in {"/v1/workspaces", "/v1/roles"}
+            target_workspace_id = request.path_params.get(
+                "workspace_id", selected_workspace_id
+            )
+            cross_workspace_access = (
+                selected_workspace_id != personal_membership.workspace_id
+                or target_workspace_id != personal_membership.workspace_id
+                or global_scope
+            )
+            if identity.platform_admin and cross_workspace_access:
+                if audit_store is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Privileged access audit storage is not configured.",
+                    )
+                try:
+                    audit_store.record_cross_workspace_access(
+                        actor_user_id=identity.user_id,
+                        action=f"{request.method} {route_path}",
+                        workspace_id=None if global_scope else target_workspace_id,
+                        request_id=request.state.request_id,
+                    )
+                except (SQLAlchemyError, ValueError) as error:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Unable to record privileged access audit.",
+                    ) from error
+            return access_context
         return WorkspaceAccessContext(
             user_id=identity.user_id,
             workspace_id="local",
