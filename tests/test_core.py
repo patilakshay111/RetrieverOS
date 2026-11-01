@@ -486,6 +486,100 @@ def test_credential_schema_migration(tmp_path, monkeypatch):
     assert "alembic_version" in tables
 
 
+# Verify workspace memberships are durable, unique, and scoped by user/workspace.
+def test_workspace_membership_repository_supports_multiple_memberships_and_roles():
+    from rag_pipeline.identity_store import WorkspaceStore
+
+    store = WorkspaceStore("sqlite:///:memory:")
+    personal = store.create_personal_workspace("user-a")
+    shared = store.create_workspace("Shared workspace")
+    store.add_membership("user-a", shared.id, roles={"hr", "employee"})
+
+    memberships = store.list_memberships("user-a")
+
+    assert {membership.workspace_id for membership in memberships} == {
+        personal.workspace_id,
+        shared.id,
+    }
+    assert store.get_membership("user-a", shared.id).roles == frozenset({"hr", "employee"})
+    assert store.get_membership("user-b", shared.id) is None
+
+
+def test_personal_workspace_provisioning_is_idempotent():
+    from rag_pipeline.identity_store import WorkspaceStore
+
+    store = WorkspaceStore("sqlite:///:memory:")
+
+    first = store.create_personal_workspace("user-a")
+    second = store.create_personal_workspace("user-a")
+
+    assert first.workspace_id == second.workspace_id
+    assert store.list_memberships("user-a") == [first]
+    assert first.roles == frozenset({"admin"})
+
+
+def test_workspace_membership_rejects_unknown_roles():
+    from rag_pipeline.identity_store import WorkspaceStore
+
+    store = WorkspaceStore("sqlite:///:memory:")
+    workspace = store.create_workspace("Shared workspace")
+
+    with pytest.raises(ValueError, match="(?i)unknown role"):
+        store.add_membership("user-a", workspace.id, roles={"superuser"})
+
+
+def test_workspace_membership_status_can_be_updated():
+    from rag_pipeline.identity_store import WorkspaceStore
+
+    store = WorkspaceStore("sqlite:///:memory:")
+    workspace = store.create_workspace("Shared workspace")
+    store.add_membership("user-a", workspace.id, roles={"employee"})
+
+    suspended = store.set_membership_status("user-a", workspace.id, "suspended")
+
+    assert suspended is not None
+    assert suspended.status == "suspended"
+    assert store.get_membership("user-a", workspace.id).status == "suspended"
+
+
+def test_workspace_membership_unique_user_workspace_pair():
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session
+
+    from rag_pipeline.identity_store import WorkspaceMembership, WorkspaceStore
+
+    store = WorkspaceStore("sqlite:///:memory:")
+    workspace = store.create_workspace("Shared workspace")
+    store.add_membership("user-a", workspace.id, roles={"employee"})
+
+    with pytest.raises(IntegrityError):
+        with Session(store._engine) as session, session.begin():
+            session.add(
+                WorkspaceMembership(
+                    user_id="user-a",
+                    workspace_id=workspace.id,
+                    roles=["employee"],
+                    status="active",
+                )
+            )
+
+
+def test_workspace_membership_schema_migration(tmp_path, monkeypatch):
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine, inspect
+
+    database_path = tmp_path / "workspace-migration.sqlite"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path.as_posix()}")
+    command.upgrade(Config("alembic.ini"), "head")
+
+    engine = create_engine(f"sqlite:///{database_path.as_posix()}")
+    tables = set(inspect(engine).get_table_names())
+    engine.dispose()
+
+    assert {"workspaces", "workspace_memberships", "role_definitions"} <= tables
+
+
 # Verify the account API can save, report, and delete a user's encrypted key.
 def test_openai_key_account_endpoints():
     from cryptography.fernet import Fernet
