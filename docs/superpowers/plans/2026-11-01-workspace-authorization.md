@@ -123,8 +123,8 @@ server-derived workspace scope and membership API.
 - Modify: `README.md`
 - Modify: `docs/PROJECT_RECREATION_GUIDE.md`
 
-- [ ] **Step 1: Add regression tests** for same user across two workspaces, two users in one workspace, role removal, platform-admin audit, and request without OIDC in production.
-- [ ] **Step 2: Run** `python -m pytest`; confirm all authorization tests pass.
-- [ ] **Step 3: Document** workspace selection header, registration, invitation acceptance, and admin boundaries.
-- [ ] **Step 4: Run** `git diff --check` and the full test suite; confirm docs match implemented routes.
+- [x] **Step 1: Add regression tests** for same user across two workspaces, two users in one workspace, role removal, platform-admin audit, and request without OIDC in production.
+- [x] **Step 2: Run** `python -m pytest`; confirm all authorization tests pass.
+- [x] **Step 3: Document** workspace selection header, registration, invitation acceptance, and admin boundaries.
+- [x] **Step 4: Run** `git diff --check` and the full test suite; confirm docs match implemented routes.
 - [ ] **Step 5: Commit** contract docs and tests.

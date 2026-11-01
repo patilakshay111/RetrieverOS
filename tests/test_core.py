@@ -1117,6 +1117,13 @@ def test_workspace_member_management_is_scoped_and_uses_existing_roles(workspace
         f"/v1/workspaces/{workspace_api.other_workspace_id}/members",
         headers=owner_headers,
     ).status_code == 403
+    invitation_count_before = len(workspace_api.sent_messages)
+    assert client.post(
+        f"/v1/workspaces/{workspace_api.other_workspace_id}/invitations",
+        headers=owner_headers,
+        json={"email": "cross-scope@example.test", "roles": ["employee"]},
+    ).status_code == 403
+    assert len(workspace_api.sent_messages) == invitation_count_before
 
     updated = client.put(
         f"/v1/workspaces/{workspace_id}/members/employee",

@@ -49,15 +49,27 @@ To turn on Keycloak login:
    created in your own Google Cloud project; never put those credentials in
    source control or this chat.
 
-The API verifies Keycloak access-token signatures, issuer, audience, expiry,
-workspace, and role claims. If a signed token has no `workspace_id` claim, its
-personal workspace is derived from its immutable subject ID. The imported realm
-assigns the `employee`, `hr`, `ceo`, `admin`, and `platform-admin` realm roles.
-For an organization workspace, a Keycloak administrator must assign a
-workspace ID and the intended roles to each user. The API applies workspace,
-owner, and role ACL checks before returning documents or passing retrieved
-evidence to the answer graph. Conversation checkpoints are namespaced by user
-and workspace.
+The API verifies Keycloak access-token signatures, issuer, audience, and
+expiry. It provisions each authenticated subject's personal workspace and
+resolves workspace membership and application roles from PostgreSQL on every
+request; workspace IDs and roles in token or browser claims are not trusted.
+Select a shared workspace with the `X-Workspace-ID` request header. The
+`platform-admin` Keycloak realm role grants platform-level administration;
+the `admin`, `ceo`, `employee`, and `hr` roles are global role definitions
+assigned to users through workspace memberships.
+
+Authenticated users can list their workspaces and read the global role
+catalog. Workspace admins can administer memberships and invite users only
+within their workspace. Only platform admins can create global role
+definitions or administer across workspaces. Invitation acceptance requires
+the invitee's verified OIDC email to match the invitation; invitation tokens
+are stored hashed, expire after the configured period (72 hours by default),
+and can be accepted once. Configure `SMTP_*` in `.env`; Compose sends mail to
+Mailpit. Privileged cross-workspace API access is recorded in PostgreSQL with
+an action, target, actor, timestamp, and request ID, without recording prompts,
+documents, answers, or tokens. The API applies workspace, owner, and role ACL
+checks before returning documents or passing retrieved evidence to the answer
+graph. Conversation checkpoints are namespaced by user and workspace.
 
 With OIDC enabled, each user can save, rotate, or delete their own OpenAI key
 from the dashboard. The API encrypts keys in Postgres using
@@ -66,20 +78,20 @@ secure backup, because losing it makes stored credentials undecryptable. Key
 plaintext is not returned by the API. In local development without OIDC, the
 legacy shared `OPENAI_API_KEY` remains available.
 
-**This is an in-progress local security foundation, not a production-ready
-deployment.** The current vector path still uses local FAISS and conversation
-checkpoints remain in memory. Redis and Qdrant start in Compose but are not yet
-used by the application; workspace invitation and role management still use
-Keycloak administration rather than an in-app control panel. The approved
-next step is to replace Streamlit with a React/Vite dashboard while retaining
-FastAPI. OpenTelemetry, authorization-scoped FAQ caching, and deployment
-automation also remain to be implemented and validated. Kubernetes is out of
-scope. GitHub Actions currently runs the offline tests, then validates Compose
-and builds the container image; it does not publish or deploy an image. The
-Compose stack has not been started in this environment because the Docker
-Engine is unavailable. Render will be tested after local implementation and
-validation. Do not expose this stack to the public internet or ingest
-confidential documents yet.
+**This is an in-progress production-hardening effort, not a production-ready
+deployment.** Workspace authorization, invitation APIs, and cross-workspace
+audit logging are implemented and covered by offline tests. The current vector
+path still uses local FAISS and conversation checkpoints remain in memory.
+Redis and Qdrant start in Compose but are not yet used by the application. The
+approved next step is to replace Streamlit with a React/Vite dashboard while
+retaining FastAPI. Durable RAG state, OpenTelemetry, authorization-scoped FAQ
+caching, and deployment automation still need implementation and validation.
+Kubernetes is out of scope. GitHub Actions currently runs the offline tests,
+then validates Compose and builds the container image; it does not publish or
+deploy an image. The Compose stack has not been started in this environment
+because the Docker Engine is unavailable. Render will be tested after local
+implementation and validation. Do not expose this stack to the public internet
+or ingest confidential documents yet.
 
 ## Production data flow
 
@@ -275,6 +287,21 @@ See the [project recreation guide](./docs/PROJECT_RECREATION_GUIDE.md) and [case
 - `POST /v1/compare`: hybrid and dense-only responses for the same question.
 - `GET`, `PUT`, `DELETE /v1/account/openai-key`: inspect whether the caller's
   key is saved, encrypt and save/rotate it, or delete it.
+- `GET /v1/workspaces`: list caller memberships (platform admins can list all).
+- `GET /v1/workspaces/{workspace_id}/members`: workspace-admin member listing.
+- `POST /v1/workspaces/{workspace_id}/members`: add a user with existing roles.
+- `PUT`, `DELETE /v1/workspaces/{workspace_id}/members/{user_id}`:
+  update or remove a workspace member.
+- `POST /v1/workspaces/{workspace_id}/invitations` and
+  `POST /v1/invitations/{token}/accept`: send and accept verified-email
+  invitations.
+- `GET /v1/roles`, `POST /v1/roles`: read global roles; only platform admins
+  can define new ones.
+
+Protected API calls require a bearer token when `OIDC_ISSUER_URL` is set.
+Workspace endpoints use current PostgreSQL membership, and privileged
+cross-workspace access is audited. Invitation messages are delivered through
+configured SMTP; local Compose uses Mailpit.
 
 For local development, set `API_KEY` to require `X-API-Key`. If
 `OIDC_ISSUER_URL` is configured, protected API routes require a verified bearer

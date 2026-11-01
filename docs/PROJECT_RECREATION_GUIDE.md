@@ -28,12 +28,14 @@ Generate local service passwords and the Fernet encryption key with
 script refuses to overwrite an existing `.env`. Never put credentials in
 source code or commit `.env`.
 
-The native-Python development setup uses SQLite for account-key storage; set
+The native-Python development setup uses SQLite for account-key, workspace,
+invitation, and audit storage; set
 `$env:DATABASE_URL = "sqlite:///./data/runtime/credentials.db"` in the API
 terminal before startup. Docker Compose overrides this with PostgreSQL and
 runs Alembic migrations before starting the API. Streamlit OIDC settings live
 in `.streamlit/secrets.toml` (use the example template and replace every
-placeholder).
+placeholder). Set `SMTP_HOST`, `SMTP_PORT`, and `SMTP_FROM` to route invitation
+mail; Compose defaults to Mailpit at <http://localhost:8025>.
 
 Production mode requires HTTPS OIDC, PostgreSQL, an encryption key, and
 restricted CORS. API-key authentication is retained for local development; it
@@ -99,6 +101,12 @@ Create FastAPI endpoints:
 - `POST /v1/ask`
 - `POST /v1/compare`
 - `GET`, `PUT`, `DELETE /v1/account/openai-key`
+- `GET /v1/workspaces`
+- `GET`, `POST /v1/workspaces/{workspace_id}/members`
+- `PUT`, `DELETE /v1/workspaces/{workspace_id}/members/{user_id}`
+- `POST /v1/workspaces/{workspace_id}/invitations`
+- `POST /v1/invitations/{token}/accept`
+- `GET`, `POST /v1/roles`
 
 Validate inputs, restrict uploads to supported formats and a bounded size,
 authenticate local requests with `X-API-Key` when configured, and document
@@ -106,6 +114,19 @@ request and response schemas through OpenAPI. OIDC-authenticated users can
 save, rotate, and delete their own encrypted OpenAI key. Build a Streamlit
 dashboard that asks questions, displays ranked chunks/citation checks and
 confidence, and compares hybrid with dense-only retrieval.
+
+The API provisions a personal workspace for each verified OIDC subject and
+uses PostgreSQL—not token-supplied workspace or role claims—as the source of
+membership and workspace roles. Clients select a workspace with
+`X-Workspace-ID`; without the header, the personal workspace is selected.
+Workspace admins are confined to their active workspace, existing global role
+definitions are assigned through membership, and only platform admins may
+create global roles or administer across workspaces. Invitations contain
+single-use, expiring random tokens, persist only the SHA-256 token hash, and
+can be accepted only by an account with the matching verified OIDC email.
+Platform-admin cross-workspace activity is persisted with the actor, action,
+target workspace, timestamp, and request ID; request content and secrets are
+excluded.
 
 ## 9. Seed, test, and evaluate
 
@@ -144,8 +165,10 @@ GitHub Actions runs tests on Python 3.11, validates Compose, and builds the
 container image after the tests pass. It does not publish or deploy the image.
 Although Redis and Qdrant are included in Compose, application retrieval still
 uses local FAISS and Redis is not wired into the request path. Durable
-checkpoints, workspace administration, OpenTelemetry, Kubernetes, and
-deployment automation remain future work.
+checkpoints, the React/Vite dashboard, OpenTelemetry, Kubernetes, and
+deployment automation remain future work. Workspace authorization,
+invitation endpoints, and privileged-access auditing are implemented; the
+Streamlit dashboard does not yet expose their full management workflows.
 
 For a short demo, ingest a new runbook, ask a direct lookup, ask a multi-hop
 question, ask something absent from the corpus, then compare hybrid and
@@ -164,6 +187,6 @@ quality.
 - [ ] An unanswerable question produces a structured abstention.
 - [ ] Dense/hybrid comparison returns both result sets.
 - [ ] Unit tests pass and all three evaluation strategies complete.
-- [ ] All 19 offline tests pass; Compose config and the container build are checked.
+- [ ] All offline tests pass; Compose config and the container build are checked.
 - [ ] Production use additionally has HTTPS OIDC, PostgreSQL, durable storage,
       secret management, observability, recovery, and a tested deployment target.
