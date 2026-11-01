@@ -231,6 +231,22 @@ class VectorStore:
         except ApiException as error:
             raise RuntimeError("Unable to delete document vectors from Qdrant.") from error
 
+    def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
+        if not chunk_ids:
+            return
+        if any(not chunk_id.strip() for chunk_id in chunk_ids):
+            raise ValueError("Qdrant chunk IDs must not be empty.")
+        try:
+            if not self._client.collection_exists(self.collection_name):
+                return
+            self._client.delete(
+                collection_name=self.collection_name,
+                points_selector=[self._point_id(chunk_id) for chunk_id in set(chunk_ids)],
+                wait=True,
+            )
+        except ApiException as error:
+            raise RuntimeError("Unable to delete selected vectors from Qdrant.") from error
+
     def check(self) -> None:
         try:
             if not self._client.collection_exists(self.collection_name):

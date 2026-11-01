@@ -19,7 +19,9 @@ from rag_pipeline.chunking import ChunkStrategy, chunk_sections
 from rag_pipeline.config import Settings
 from rag_pipeline.documents import load_document
 from rag_pipeline.embeddings import EmbeddingProvider
+from rag_pipeline.lexical_store import LexicalStore
 from rag_pipeline.models import AccessContext, Chunk, DocumentInfo, IngestionResult
+from rag_pipeline.vector_store import VectorStore
 
 
 # Keep each active index generation internally consistent across its chunk and vector files.
@@ -35,9 +37,19 @@ class IndexSnapshot:
 # Manage the raw source archive and immutable, atomically published index generations.
 class KnowledgeBase:
     # Load the current snapshot or initialize an empty, local FAISS corpus.
-    def __init__(    self, settings: Settings, embeddings: EmbeddingProvider | None):
+    def __init__(
+        self,
+        settings: Settings,
+        embeddings: EmbeddingProvider | None,
+        vector_store: VectorStore | None = None,
+        lexical_store: LexicalStore | None = None,
+    ):
+        if (vector_store is None) != (lexical_store is None):
+            raise ValueError("Qdrant and lexical stores must be configured together.")
         self.settings = settings
         self.embeddings = embeddings
+        self.vector_store = vector_store
+        self.lexical_store = lexical_store
         self.root = settings.data_dir
         self.raw_dir = self.root / "raw"
         self.snapshots_dir = self.root / "index" / "snapshots"
@@ -309,8 +321,29 @@ class KnowledgeBase:
                 required_roles=roles,
             )
             documents[document_key] = document
+            old_remote_chunk_ids: list[str] = []
+            if self.vector_store is not None and self.lexical_store is not None:
+                if new_vectors.shape[1] != self.vector_store.vector_size:
+                    raise ValueError(
+                        "Embedding dimensions do not match QDRANT_VECTOR_SIZE."
+                    )
+                if accepted_chunks:
+                    self.vector_store.upsert(
+                        accepted_chunks,
+                        np.asarray(accepted_vectors, dtype=np.float32),
+                    )
+                old_remote_chunk_ids = self.lexical_store.replace_document(
+                    context.workspace_id,
+                    filename,
+                    accepted_chunks,
+                )
             snapshot = self._commit(all_chunks, all_vectors, documents)
             self._snapshot = snapshot
+            if self.vector_store is not None:
+                new_ids = {chunk.chunk_id for chunk in accepted_chunks}
+                self.vector_store.delete_chunks(
+                    [chunk_id for chunk_id in old_remote_chunk_ids if chunk_id not in new_ids]
+                )
             return IngestionResult(
                 document=document,
                 inserted_chunks=len(accepted_chunks),

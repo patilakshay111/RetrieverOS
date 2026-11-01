@@ -57,21 +57,44 @@ Record source, source digest, chunk index, section, page, strategy, and characte
 ## 4. Persist source files and synchronized indexes
 
 Keep raw uploaded bytes in a content-addressed archive so they can be
-reprocessed. Embed chunks with the configured embedding model; normalize
-vectors and use a FAISS inner-product index as cosine retrieval.
+reprocessed. Embed chunks with the configured embedding model and normalize
+vectors. When running natively without both `QDRANT_URL` and `DATABASE_URL`,
+use a FAISS inner-product index for cosine retrieval.
 
 Before committing an incoming chunk, compare its vector against the retained
 corpus and the other accepted chunks. Skip it when cosine similarity exceeds
-the configured deduplication threshold. Save chunk metadata, vectors, FAISS
-index, and document inventory in a fresh generation directory; only point
-`CURRENT` at that generation after every file is written successfully. BM25 is
-built lazily from the active chunk snapshot and cached per authorization scope.
+the configured deduplication threshold. In local mode, save chunk metadata,
+vectors, the FAISS index, and document inventory in a fresh generation
+directory; only point `CURRENT` at that generation after every file is written
+successfully. BM25 is built lazily from the active chunk snapshot and cached
+per authorization scope.
 
-Add a re-index command that verifies each current document's raw-file digest, reloads the original source, and reruns the same chunking/embedding path without requiring an upload. Build/cache BM25 from the active chunk snapshot on the first sparse or hybrid query for that generation.
+When both `QDRANT_URL` and `DATABASE_URL` are configured, write accepted dense
+vectors to Qdrant with workspace, owner, and required-role payloads, then
+replace that workspace/source's current chunk rows in the PostgreSQL catalog.
+The catalog indexes full-text data for lexical search and is the source of
+current chunk text and ACL metadata. Publish the local snapshot and then remove
+superseded Qdrant point IDs. These writes span separate systems and are not one
+transaction; retrieval checks Qdrant candidates against the current catalog
+before using their evidence. Run the Alembic migrations through revision
+`0005_document_chunk_catalog` before enabling this mode.
+
+The re-index command verifies each current document's raw-file digest, reloads
+the original source, and reruns the same chunking/embedding path without
+requiring an upload. In local mode, build/cache BM25 from the active snapshot
+on the first sparse or hybrid query for that generation; shared mode uses
+PostgreSQL full-text search instead.
 
 ## 5. Add hybrid retrieval and reranking
 
-For each query, retrieve dense and BM25 top-k results. Fuse their ranked chunk IDs with configurable weighted Reciprocal Rank Fusion, send the top candidates through a cross-encoder, and keep the configured final top-k. Preserve per-stage scores for inspection. Keep dense-only and sparse-only modes available for comparison.
+For local mode, retrieve dense and BM25 top-k results from the FAISS snapshot.
+For shared mode, retrieve dense candidates from Qdrant and lexical candidates
+from PostgreSQL full-text search, applying workspace, owner, and role ACL
+predicates inside each store before ranking. Confirm dense chunk IDs against
+the current catalog, fuse the authorized ranked IDs with configurable weighted
+Reciprocal Rank Fusion, send top candidates through a cross-encoder, and keep
+the configured final top-k. Preserve per-stage scores for inspection. Keep
+dense-only and sparse-only modes available for comparison.
 
 ## 6. Add grounded answers and citation checks
 
@@ -163,16 +186,18 @@ docker compose exec api rag-pipeline-seed
 
 GitHub Actions runs tests on Python 3.11, validates Compose, and builds the
 container image after the tests pass. It does not publish or deploy the image.
-Although Redis and Qdrant are included in Compose, application retrieval still
-uses local FAISS and Redis is not wired into the request path. Durable
-checkpoints, the React/Vite dashboard, OpenTelemetry, Kubernetes, and
-deployment automation remain future work. Workspace authorization,
+With Compose's Qdrant and PostgreSQL settings present, shared retrieval uses
+Qdrant and the PostgreSQL chunk catalog; native Python without both settings
+uses local FAISS/BM25. Redis is not wired into the request path. Durable
+conversation checkpoints, the React/Vite dashboard, OpenTelemetry, Kubernetes,
+and deployment automation remain future work. Workspace authorization,
 invitation endpoints, and privileged-access auditing are implemented; the
 Streamlit dashboard does not yet expose their full management workflows.
 For native local development, leave `QDRANT_URL` blank; Compose configures its
 internal Qdrant endpoint. The API manages the configured Qdrant client with its
-application lifespan, while dense retrieval is still on the durable-RAG task
-list. `QDRANT_VECTOR_SIZE` defaults to 1536 and must match the embedding model.
+application lifespan. `QDRANT_VECTOR_SIZE` defaults to 1536 and must match
+the embedding model. Docker runtime validation is required before claiming
+the Compose service integration has been exercised end to end.
 
 For a short demo, ingest a new runbook, ask a direct lookup, ask a multi-hop
 question, ask something absent from the corpus, then compare hybrid and

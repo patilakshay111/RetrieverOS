@@ -4,7 +4,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
 [![CI](https://github.com/patilakshay111/hybrid-rag-studio/actions/workflows/tests.yml/badge.svg)](https://github.com/patilakshay111/hybrid-rag-studio/actions/workflows/tests.yml)
 
-A production-minded, open-source Python 3.11+ RAG application for Markdown, text, HTML, and PDF documents. It combines local FAISS dense retrieval with BM25 keyword search, weighted Reciprocal Rank Fusion, an optional cross-encoder reranker (enabled by default), grounded OpenAI answers, per-claim citation checks, and confidence scoring.
+A production-minded, open-source Python 3.11+ RAG application for Markdown, text, HTML, and PDF documents. It supports local FAISS/BM25 retrieval and shared Qdrant/PostgreSQL dense and full-text retrieval, weighted Reciprocal Rank Fusion, an optional cross-encoder reranker (enabled by default), grounded OpenAI answers, per-claim citation checks, and confidence scoring.
 
 The workflow is implemented as a LangGraph `StateGraph` with Pydantic state and an in-memory `MemorySaver` checkpoint per `thread_id`, retaining the latest 20 conversation turns. The FastAPI service exposes ingestion and question endpoints; the Streamlit dashboard supports side-by-side hybrid and dense-only answers.
 
@@ -80,22 +80,27 @@ legacy shared `OPENAI_API_KEY` remains available.
 
 **This is an in-progress production-hardening effort, not a production-ready
 deployment.** Workspace authorization, invitation APIs, and cross-workspace
-audit logging are implemented and covered by offline tests. The current vector
-path still uses local FAISS and conversation checkpoints remain in memory.
-Redis and Qdrant start in Compose but are not yet used by the application. The
-approved next step is to replace Streamlit with a React/Vite dashboard while
-retaining FastAPI. Durable RAG state, OpenTelemetry, authorization-scoped FAQ
-caching, and deployment automation still need implementation and validation.
-Kubernetes is out of scope. GitHub Actions currently runs the offline tests,
-then validates Compose and builds the container image; it does not publish or
-deploy an image. The Compose stack has not been started in this environment
-because the Docker Engine is unavailable. Render will be tested after local
-implementation and validation. Do not expose this stack to the public internet
-or ingest confidential documents yet.
+audit logging are implemented and covered by offline tests. When both
+`QDRANT_URL` and `DATABASE_URL` are configured, ingestion writes vectors to
+Qdrant and current chunks to the PostgreSQL catalog, and retrieval uses those
+shared stores. Native development without both settings continues to use local
+FAISS and BM25. Conversation checkpoints remain in memory; Redis caching,
+OpenTelemetry, and deployment automation still need implementation and
+validation. Kubernetes is out of scope. GitHub Actions currently runs the
+offline tests, then validates Compose and builds the container image; it does
+not publish or deploy an image. The Compose stack has not been started in this
+environment because the Docker Engine is unavailable. Render will be tested
+after local implementation and validation. Do not expose this stack to the
+public internet or ingest confidential documents yet.
 
 ## Production data flow
 
-These diagrams follow the implemented ingestion and question-answering paths. The index is local FAISS; document embeddings and answer/judge calls use the configured OpenAI models. BM25 is rebuilt from the exact active chunk snapshot on the first sparse or hybrid search for that generation, then cached in process.
+These diagrams follow the implemented ingestion and question-answering paths.
+With both `QDRANT_URL` and `DATABASE_URL` configured, Qdrant provides dense
+candidates and PostgreSQL provides the current-chunk catalog and full-text
+search. Otherwise, retrieval uses the local FAISS snapshot and in-process
+BM25. Document embeddings and answer/judge calls use the configured OpenAI
+models.
 
 ### Ingestion and index publication
 
@@ -110,9 +115,17 @@ flowchart LR
     reindex --> ingest
     ingest --> embed["Embed chunks<br/>configured OpenAI model"]
     embed --> dedupe["Deduplicate and replace<br/>this source's chunks"]
-    dedupe --> stage["Write complete staged<br/>index generation"]
-    stage --> publish["Atomically publish<br/>index/CURRENT"]
-    publish --> active["Active index snapshot"]
+    dedupe --> durable{"QDRANT_URL and<br/>DATABASE_URL configured?"}
+    durable -->|Yes| vectors["Upsert accepted vectors<br/>Qdrant with ACL payload"]
+    vectors --> catalog["Replace workspace/source<br/>PostgreSQL catalog rows"]
+    durable -->|No| stage["Write complete staged<br/>local index generation"]
+    catalog --> stage
+    stage --> publish["Atomically publish<br/>local index/CURRENT"]
+    publish --> remote{"Durable mode?"}
+    remote -->|Yes| cleanup["Delete superseded Qdrant IDs"]
+    remote -->|No| active["Active local snapshot"]
+    cleanup --> active
+    cleanup --> qdrant["Qdrant collection"]
 
     classDef input fill:#0d1b2a,stroke:#4cc9f0,color:#ffffff;
     classDef process fill:#1b263b,stroke:#4cc9f0,color:#ffffff;
@@ -121,7 +134,8 @@ flowchart LR
 
     class upload,samples,archive input;
     class api,seed,reindex,ingest,dedupe process;
-    class stage,publish,active storage;
+    class stage,publish,active,catalog,qdrant storage;
+    class vectors process;
     class embed provider;
 ```
 
@@ -133,8 +147,16 @@ flowchart LR
     client["Streamlit or API client"] --> ask["POST /v1/ask"]
     ask --> workflow["RAGService / LangGraph<br/>load thread history"]
     workflow --> query["Build query from question<br/>and recent history"]
-    query --> retrieve["Retrieve evidence<br/>FAISS, BM25, or hybrid RRF"]
-    retrieve --> rerank["Optional cross-encoder reranking"]
+    query --> embed["Embed query<br/>configured OpenAI model"]
+    embed --> scope{"Shared stores configured?"}
+    scope -->|Yes| dense["Qdrant dense search<br/>workspace/owner/role filters"]
+    dense --> catalog["PostgreSQL catalog check<br/>current authorized chunk IDs"]
+    catalog --> fusion["Fuse authorized candidates"]
+    scope -->|Yes| lexical["PostgreSQL full-text search<br/>workspace/owner/role filters"]
+    lexical --> fusion
+    scope -->|No| local["FAISS dense +<br/>in-process BM25"]
+    local --> fusion
+    fusion --> rerank["Optional cross-encoder reranking"]
     rerank --> gate{"Retrieval confidence<br/>below threshold?"}
     gate -->|Yes| abstain["Return insufficient-context answer"]
     gate -->|No| answer["Generate grounded answer<br/>OpenAI"]
@@ -151,7 +173,7 @@ flowchart LR
     classDef provider fill:#1b263b,stroke:#06d6a0,color:#ffffff;
 
     class client,response client;
-    class ask,workflow,query,retrieve,rerank,abstain,score service;
+    class ask,workflow,query,retrieve,embed,dense,catalog,lexical,local,fusion,rerank,abstain,score service;
     class gate decision;
     class answer,citations,completeness provider;
 ```
@@ -171,8 +193,9 @@ notepad .env
 
 In `.env`, set `OPENAI_API_KEY` to your real OpenAI API key. Keep `APP_ENV=development` for local use. `API_KEY` can remain blank for a local-only demo; if you set it, send the same value as `X-API-Key` when calling protected endpoints. Do not commit `.env`.
 For native local development, leave `QDRANT_URL` blank; Docker Compose
-configures its internal Qdrant service automatically. Production requires
-`QDRANT_URL`. `QDRANT_VECTOR_SIZE` defaults to 1536 for the default
+configures its internal Qdrant service automatically. Shared retrieval
+requires both `QDRANT_URL` and `DATABASE_URL`; production configuration uses
+Qdrant and PostgreSQL. `QDRANT_VECTOR_SIZE` defaults to 1536 for the default
 `text-embedding-3-small` model and must match the configured embedding model.
 For this native-Python setup (not Docker Compose), set SQLite as the local
 credential store in the API terminal before starting it:
@@ -190,7 +213,11 @@ runs migrations automatically.
 python -m rag_pipeline.seed
 ```
 
-This embeds the sample corpus and builds the local FAISS index. It requires `OPENAI_API_KEY`. Re-running it refreshes the same sample documents. To select a chunking strategy, use `python -m rag_pipeline.seed --strategy fixed`, `recursive`, or `semantic`.
+This embeds the sample corpus and publishes its local snapshot; when both
+`QDRANT_URL` and `DATABASE_URL` are configured, it also writes to Qdrant and
+the PostgreSQL chunk catalog. It requires `OPENAI_API_KEY`. Re-running it
+refreshes the same sample documents. To select a chunking strategy, use
+`python -m rag_pipeline.seed --strategy fixed`, `recursive`, or `semantic`.
 
 ### 2. Start the API and dashboard
 
@@ -228,7 +255,11 @@ python -m pytest
 
 ### Compare retrieval modes
 
-The dashboard toggle compares **hybrid** (dense + BM25 with fusion) against **dense-only** for the same question. `POST /v1/compare` returns both results. To query sparse-only retrieval as well, use `POST /v1/ask` in the API docs and choose `sparse`; the endpoint also accepts `hybrid` and `dense`.
+The dashboard toggle compares **hybrid** (dense + lexical retrieval with
+fusion) against **dense-only** for the same question. Local mode uses BM25;
+shared mode uses PostgreSQL full-text search. `POST /v1/compare` returns both
+results. To query sparse-only retrieval as well, use `POST /v1/ask` in the
+API docs and choose `sparse`; the endpoint also accepts `hybrid` and `dense`.
 
 For example, with the API running in local development mode and no `API_KEY` configured:
 
@@ -315,13 +346,11 @@ uploads and immutable index generations are stored under `DATA_DIR`.
 
 ## Architecture notes
 
-- FAISS `IndexFlatIP` stores normalized embeddings and supports exact cosine-ranked lookup on local disk. `chunks.json`, `vectors.npy`, and the FAISS index are committed as one generation behind an atomic pointer.
-- BM25 is rebuilt from the same committed chunk snapshot, so dense and sparse indexes cannot independently drift.
+- Without both `QDRANT_URL` and `DATABASE_URL`, FAISS `IndexFlatIP` stores normalized embeddings and supports exact cosine-ranked lookup on local disk. `chunks.json`, `vectors.npy`, and the FAISS index are committed as one generation behind an atomic pointer; BM25 is built from that snapshot.
+- With both settings, Qdrant stores dense vectors with workspace, owner, and role payloads, while PostgreSQL stores the current chunk catalog and indexed full-text search data. Both stores apply authorization filters before ranking. Dense candidates are checked against the current catalog before fusion so stale Qdrant points are not returned.
+- Durable ingestion writes accepted vectors, replaces the source's catalog rows in one database transaction, publishes the local snapshot, then removes superseded Qdrant point IDs. The Qdrant and PostgreSQL operations are not one cross-service transaction.
 - Duplicate chunks with cosine similarity above the configured threshold are skipped.
 - Confidence combines calibrated retrieval relevance, claim-level verified citation coverage, and an LLM completeness assessment. Low retrieval confidence returns a structured abstention.
 - Original uploads are content-addressed under `DATA_DIR/raw`; `rag-pipeline-reindex` re-embeds the current document manifest without re-uploading.
 - The default reranker is `cross-encoder/ms-marco-MiniLM-L-6-v2`. It loads on the first query and may need network access to download model weights; disable it for a lightweight offline test using `RERANKER_ENABLED=false`.
 - The sample corpus is synthetic. Do not ingest confidential material into a demo environment.
-
-The active application index remains local FAISS; the Compose Qdrant service is
-not yet connected to retrieval.

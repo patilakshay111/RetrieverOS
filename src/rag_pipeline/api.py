@@ -199,6 +199,8 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
         try:
             yield
         finally:
+            if isinstance(runtime, RAGService):
+                runtime.close()
             if vector_store is not None:
                 vector_store.close()
 
@@ -373,7 +375,15 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
         nonlocal runtime
         if runtime is None:
             try:
-                runtime = RAGService(configured)
+                runtime = RAGService(
+                    configured,
+                    vector_store=app.state.vector_store,
+                )
+            except SQLAlchemyError as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Unable to initialize shared retrieval storage.",
+                ) from error
             except (RuntimeError, ValueError) as error:
                 raise HTTPException(status_code=503, detail=str(error)) from error
         return runtime
@@ -550,7 +560,15 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
             raise
         except PermissionError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
-        except (OSError, RuntimeError, ValueError) as error:
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="Shared retrieval storage is unavailable."
+            ) from error
+        except (OSError, RuntimeError) as error:
+            raise HTTPException(
+                status_code=503, detail="Ingestion dependencies are unavailable."
+            ) from error
+        except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
     # Retrieve and answer one question with source-level evidence and quality scores.
@@ -574,6 +592,10 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
             )
         except HTTPException:
             raise
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="Shared retrieval storage is unavailable."
+            ) from error
         except (OSError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 

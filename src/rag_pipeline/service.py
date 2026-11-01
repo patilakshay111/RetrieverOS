@@ -10,9 +10,11 @@ from rag_pipeline.config import Settings
 from rag_pipeline.embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
 from rag_pipeline.generation import AnswerGenerator
 from rag_pipeline.graph import build_graph
+from rag_pipeline.lexical_store import LexicalStore
 from rag_pipeline.models import AccessContext, AnswerResponse, AnswerState
 from rag_pipeline.retrieval import CrossEncoderReranker, HybridRetriever
 from rag_pipeline.storage import KnowledgeBase
+from rag_pipeline.vector_store import VectorStore
 
 
 # Assemble the reusable components shared by API and evaluation requests.
@@ -24,12 +26,53 @@ class RAGService:
         embeddings: EmbeddingProvider | None = None,
         generator: AnswerGenerator | None = None,
         use_memory_saver: bool = True,
+        vector_store: VectorStore | None = None,
+        lexical_store: LexicalStore | None = None,
     ):
         self.settings = settings
         self.embeddings = embeddings or (
             OpenAIEmbeddingProvider(settings) if settings.openai_api_key else None
         )
-        self.knowledge_base = KnowledgeBase(settings, self.embeddings)
+        shared_retrieval_configured = bool(settings.qdrant_url and settings.database_url)
+        if lexical_store is not None and not shared_retrieval_configured:
+            raise ValueError(
+                "Qdrant and PostgreSQL must both be configured for shared retrieval."
+            )
+        self._owns_vector_store = shared_retrieval_configured and vector_store is None
+        self._owns_lexical_store = shared_retrieval_configured and lexical_store is None
+        self.vector_store = (
+            vector_store
+            if vector_store is not None
+            else (
+                VectorStore(
+                    settings.qdrant_url,
+                    vector_size=settings.qdrant_vector_size,
+                )
+                if shared_retrieval_configured
+                else None
+            )
+        )
+        self.lexical_store = (
+            lexical_store
+            if lexical_store is not None
+            else (
+                LexicalStore(settings.database_url)
+                if shared_retrieval_configured
+                else None
+            )
+        )
+        durable_vector_store = (
+            self.vector_store if shared_retrieval_configured else None
+        )
+        durable_lexical_store = (
+            self.lexical_store if shared_retrieval_configured else None
+        )
+        self.knowledge_base = KnowledgeBase(
+            settings,
+            self.embeddings,
+            vector_store=durable_vector_store,
+            lexical_store=durable_lexical_store,
+        )
         self.generator = generator or (
             AnswerGenerator(settings) if settings.openai_api_key else None
         )
@@ -41,7 +84,14 @@ class RAGService:
         self._graph_cache: OrderedDict[str, object] = OrderedDict()
         self._graph_lock = threading.Lock()
         self.retriever = (
-            HybridRetriever(self.knowledge_base, self.embeddings, settings, reranker)
+            HybridRetriever(
+                self.knowledge_base,
+                self.embeddings,
+                settings,
+                reranker,
+                vector_store=durable_vector_store,
+                lexical_store=durable_lexical_store,
+            )
             if self.embeddings is not None
             else None
         )
@@ -74,7 +124,20 @@ class RAGService:
             embeddings = OpenAIEmbeddingProvider(self.settings, api_key)
             generator = AnswerGenerator(self.settings, api_key)
             retriever = HybridRetriever(
-                self.knowledge_base, embeddings, self.settings, self._reranker
+                self.knowledge_base,
+                embeddings,
+                self.settings,
+                self._reranker,
+                vector_store=(
+                    self.vector_store
+                    if self.settings.qdrant_url and self.settings.database_url
+                    else None
+                ),
+                lexical_store=(
+                    self.lexical_store
+                    if self.settings.qdrant_url and self.settings.database_url
+                    else None
+                ),
             )
             graph = build_graph(
                 retriever,
@@ -87,6 +150,12 @@ class RAGService:
             if len(self._graph_cache) > 64:
                 self._graph_cache.popitem(last=False)
             return graph
+
+    def close(self) -> None:
+        if self._owns_lexical_store and self.lexical_store is not None:
+            self.lexical_store.close()
+        if self._owns_vector_store and self.vector_store is not None:
+            self.vector_store.close()
 
     # Run the graph with a stable checkpoint thread and return a typed response.
     def ask(

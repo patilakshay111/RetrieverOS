@@ -345,6 +345,51 @@ def test_vector_store_delete_document_is_workspace_scoped():
     store.close()
 
 
+@pytest.mark.filterwarnings("ignore:Payload indexes have no effect.*:UserWarning")
+def test_vector_store_deletes_only_selected_chunk_ids():
+    from qdrant_client import QdrantClient
+
+    from rag_pipeline.models import WorkspaceAccessContext
+    from rag_pipeline.vector_store import VectorStore
+
+    client = QdrantClient(":memory:")
+    store = VectorStore(
+        "http://qdrant.example.test:6333",
+        collection_name="selected-chunk-delete-test",
+        vector_size=3,
+        client=client,
+    )
+    chunks = [
+        Chunk(
+            chunk_id=chunk_id,
+            text=chunk_id,
+            source="same.md",
+            source_sha256="a" * 64,
+            chunk_index=index,
+            chunking_strategy="recursive",
+            character_count=len(chunk_id),
+            workspace_id="workspace-a",
+            owner_id="alice",
+        )
+        for index, chunk_id in enumerate(("keep", "remove"))
+    ]
+    store.upsert(chunks, np.asarray([[1, 0, 0], [1, 0, 0]], dtype=np.float32))
+
+    store.delete_chunks(["remove"])
+    results = store.search(
+        np.asarray([1, 0, 0], dtype=np.float32),
+        WorkspaceAccessContext(
+            user_id="alice",
+            workspace_id="workspace-a",
+            roles=frozenset(),
+        ),
+        limit=10,
+    )
+
+    assert [item.chunk.chunk_id for item in results] == ["keep"]
+    store.close()
+
+
 # Provide deterministic local embeddings for tests without external API credentials.
 class FakeEmbeddings:
     # Create reproducible normalized vectors from stable text hashes.
@@ -612,6 +657,403 @@ def test_retrieval_excludes_documents_outside_workspace_and_roles(tmp_path):
             for item in results
         )
         assert all(item.chunk.source != "hr.md" for item in results)
+
+
+def test_retrieval_acl_lexical_store_filters_workspace_owner_and_roles():
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
+
+    from rag_pipeline.credentials import Base
+    from rag_pipeline.lexical_store import LexicalStore
+    from rag_pipeline.models import WorkspaceAccessContext
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    store = LexicalStore("sqlite://", engine=engine)
+    chunks = [
+        Chunk(
+            chunk_id="owner",
+            text="Salary compensation owner record.",
+            source="same.md",
+            source_sha256="a" * 64,
+            chunk_index=0,
+            chunking_strategy="recursive",
+            character_count=34,
+            workspace_id="workspace-a",
+            owner_id="alice",
+            required_roles=["hr"],
+        ),
+        Chunk(
+            chunk_id="role",
+            text="Salary compensation HR record.",
+            source="same.md",
+            source_sha256="b" * 64,
+            chunk_index=0,
+            chunking_strategy="recursive",
+            character_count=31,
+            workspace_id="workspace-a",
+            owner_id="bob",
+            required_roles=["hr"],
+        ),
+        Chunk(
+            chunk_id="private",
+            text="Salary compensation CEO record.",
+            source="same.md",
+            source_sha256="c" * 64,
+            chunk_index=0,
+            chunking_strategy="recursive",
+            character_count=32,
+            workspace_id="workspace-a",
+            owner_id="carol",
+            required_roles=["ceo"],
+        ),
+        Chunk(
+            chunk_id="other-workspace",
+            text="Salary compensation other workspace record.",
+            source="same.md",
+            source_sha256="d" * 64,
+            chunk_index=0,
+            chunking_strategy="recursive",
+            character_count=44,
+            workspace_id="workspace-b",
+            owner_id="alice",
+            required_roles=["hr"],
+        ),
+    ]
+    store.replace_document("workspace-a", "same.md", chunks[:3])
+    store.replace_document("workspace-b", "same.md", chunks[3:])
+
+    results = store.search(
+        "salary compensation",
+        WorkspaceAccessContext(
+            user_id="alice",
+            workspace_id="workspace-a",
+            roles=frozenset({"hr"}),
+        ),
+        limit=10,
+    )
+
+    assert {item.chunk.chunk_id for item in results} == {"owner", "role"}
+    assert [item.rank for item in results] == [1, 2]
+    store.close()
+
+
+def test_retrieval_acl_lexical_store_replaces_and_deletes_by_workspace_source():
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
+
+    from rag_pipeline.credentials import Base
+    from rag_pipeline.lexical_store import LexicalStore
+    from rag_pipeline.models import WorkspaceAccessContext
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    store = LexicalStore("sqlite://", engine=engine)
+
+    def make_chunk(chunk_id: str, workspace_id: str, text: str) -> Chunk:
+        return Chunk(
+            chunk_id=chunk_id,
+            text=text,
+            source="policy.md",
+            source_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            chunk_index=0,
+            chunking_strategy="recursive",
+            character_count=len(text),
+            workspace_id=workspace_id,
+            owner_id="alice",
+            required_roles=["employee"],
+        )
+
+    old_a = make_chunk("old-a", "workspace-a", "Old workspace A policy.")
+    current_a = make_chunk("new-a", "workspace-a", "Current workspace A policy.")
+    current_b = make_chunk("current-b", "workspace-b", "Current workspace B policy.")
+    store.replace_document("workspace-a", "policy.md", [old_a])
+    store.replace_document("workspace-b", "policy.md", [current_b])
+    store.replace_document("workspace-a", "policy.md", [current_a])
+
+    results_a = store.search(
+        "current workspace",
+        WorkspaceAccessContext(
+            user_id="alice",
+            workspace_id="workspace-a",
+            roles=frozenset({"employee"}),
+        ),
+        limit=10,
+    )
+    results_b = store.search(
+        "current workspace",
+        WorkspaceAccessContext(
+            user_id="alice",
+            workspace_id="workspace-b",
+            roles=frozenset({"employee"}),
+        ),
+        limit=10,
+    )
+
+    assert [item.chunk.chunk_id for item in results_a] == ["new-a"]
+    assert [item.chunk.chunk_id for item in results_b] == ["current-b"]
+    store.delete_document("workspace-a", "policy.md")
+    assert store.search(
+        "current workspace",
+        WorkspaceAccessContext(
+            user_id="alice",
+            workspace_id="workspace-a",
+            roles=frozenset({"employee"}),
+        ),
+        limit=10,
+    ) == []
+    assert [item.chunk.chunk_id for item in store.search(
+        "current workspace",
+        WorkspaceAccessContext(
+            user_id="alice",
+            workspace_id="workspace-b",
+            roles=frozenset({"employee"}),
+        ),
+        limit=10,
+    )] == ["current-b"]
+    store.close()
+
+
+@pytest.mark.filterwarnings("ignore:Payload indexes have no effect.*:UserWarning")
+def test_retrieval_acl_ingestion_and_hybrid_search_use_shared_stores(tmp_path):
+    from qdrant_client import QdrantClient
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
+
+    from rag_pipeline.credentials import Base
+    from rag_pipeline.lexical_store import LexicalStore
+    from rag_pipeline.models import WorkspaceAccessContext
+    from rag_pipeline.vector_store import VectorStore
+
+    settings = replace(
+        Settings.from_env(),
+        data_dir=tmp_path,
+        reranker_enabled=False,
+        chunk_size=1000,
+        chunk_overlap=0,
+    )
+    embeddings = FakeEmbeddings()
+    vector_client = QdrantClient(":memory:")
+    vector_store = VectorStore(
+        "http://qdrant.example.test:6333",
+        collection_name="shared-retrieval-test",
+        vector_size=32,
+        client=vector_client,
+    )
+    lexical_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(lexical_engine)
+    lexical_store = LexicalStore("sqlite://", engine=lexical_engine)
+    knowledge_base = KnowledgeBase(
+        settings,
+        embeddings,
+        vector_store=vector_store,
+        lexical_store=lexical_store,
+    )
+    owner = WorkspaceAccessContext(
+        user_id="hr-owner",
+        workspace_id="workspace-a",
+        roles=frozenset({"hr"}),
+    )
+    employee = WorkspaceAccessContext(
+        user_id="employee",
+        workspace_id="workspace-a",
+        roles=frozenset({"employee"}),
+    )
+    other_workspace = WorkspaceAccessContext(
+        user_id="hr-owner",
+        workspace_id="workspace-b",
+        roles=frozenset({"hr"}),
+    )
+    hr_content = b"Salary compensation bands are confidential to HR."
+    other_content = b"Salary compensation bands in the other workspace."
+    knowledge_base.ingest(
+        "policy.md", hr_content, "recursive", owner, ["hr"]
+    )
+    knowledge_base.ingest(
+        "policy.md", other_content, "recursive", other_workspace, ["hr"]
+    )
+    retriever = HybridRetriever(
+        knowledge_base,
+        embeddings,
+        settings,
+        vector_store=vector_store,
+        lexical_store=lexical_store,
+    )
+
+    for mode in ("dense", "sparse", "hybrid"):
+        employee_results, _ = retriever.search(
+            "salary compensation", mode, employee
+        )
+        owner_results, _ = retriever.search("salary compensation", mode, owner)
+        other_results, _ = retriever.search(
+            "salary compensation", mode, other_workspace
+        )
+        assert employee_results == []
+        assert {item.chunk.workspace_id for item in owner_results} == {"workspace-a"}
+        assert {item.chunk.workspace_id for item in other_results} == {"workspace-b"}
+
+    replacement_content = b"New annual salary bands are restricted to HR."
+    knowledge_base.ingest(
+        "policy.md", replacement_content, "recursive", owner, ["hr"]
+    )
+    replaced, _ = retriever.search("annual salary", "hybrid", owner)
+    assert replaced
+    assert all(item.chunk.source_sha256 == hashlib.sha256(replacement_content).hexdigest()
+               for item in replaced)
+    assert all(item.chunk.required_roles == ["hr"] for item in replaced)
+    vector_store.close()
+    lexical_store.close()
+
+
+def test_reindex_preserves_document_acl_and_closes_service(tmp_path, monkeypatch, capsys):
+    import sys
+    from types import SimpleNamespace
+
+    import rag_pipeline.reindex as reindex
+
+    settings = Settings.from_env()
+    content = b"Reindexed HR-only policy."
+    digest = hashlib.sha256(content).hexdigest()
+    raw_path = tmp_path / "policy.md"
+    raw_path.write_bytes(content)
+    document = SimpleNamespace(
+        source="policy.md",
+        source_sha256=digest,
+        chunking_strategy="recursive",
+        owner_id="hr-owner",
+        workspace_id="workspace-a",
+        required_roles=["hr"],
+    )
+    ingest_calls = []
+    closed = []
+
+    class FakeKnowledgeBase:
+        def list_documents(self):
+            return [document]
+
+        def raw_path(self, source, source_digest):
+            assert source == document.source
+            assert source_digest == document.source_sha256
+            return raw_path
+
+        def ingest(self, *args, **kwargs):
+            ingest_calls.append((args, kwargs))
+            return SimpleNamespace(model_dump=lambda mode: {"source": args[0]})
+
+    class FakeService:
+        def __init__(self, _settings):
+            self.knowledge_base = FakeKnowledgeBase()
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(reindex.Settings, "from_env", lambda: settings)
+    monkeypatch.setattr(reindex, "RAGService", FakeService)
+    monkeypatch.setattr(sys, "argv", ["rag-pipeline-reindex"])
+
+    reindex.main()
+    capsys.readouterr()
+
+    args, kwargs = ingest_calls[0]
+    access_context = kwargs["access_context"]
+    assert args[:3] == ("policy.md", content, "recursive")
+    assert access_context.user_id == "hr-owner"
+    assert access_context.workspace_id == "workspace-a"
+    assert access_context.roles == frozenset({"hr"})
+    assert access_context.platform_admin
+    assert kwargs["required_roles"] == ["hr"]
+    assert closed == [True]
+
+
+def test_api_returns_service_unavailable_for_lexical_database_errors(monkeypatch):
+    from fastapi.testclient import TestClient
+    from sqlalchemy.exc import SQLAlchemyError
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+
+    def unavailable(*_args, **_kwargs):
+        raise SQLAlchemyError("catalog database is offline")
+
+    fake_service = SimpleNamespace(
+        knowledge_base=SimpleNamespace(ingest=unavailable),
+        ask=unavailable,
+    )
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        api_key=None,
+        database_url=None,
+        qdrant_url=None,
+        user_key_encryption_key=None,
+        oidc_issuer_url=None,
+        oidc_jwks_url=None,
+        openai_api_key="test-key",
+    )
+    with (
+        patch("rag_pipeline.api.OpenAIEmbeddingProvider", return_value=object()),
+        TestClient(create_app(settings=settings, service=fake_service)) as client,
+    ):
+        ask_response = client.post(
+            "/v1/ask",
+            json={"question": "What does the policy say?"},
+        )
+        ingest_response = client.post(
+            "/v1/ingest",
+            files={"file": ("policy.txt", b"Policy text")},
+        )
+
+    assert ask_response.status_code == 503
+    assert ingest_response.status_code == 503
+
+
+def test_api_returns_service_unavailable_for_qdrant_ingestion_errors():
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+
+    def qdrant_unavailable(*_args, **_kwargs):
+        raise RuntimeError("Unable to write vectors to Qdrant.")
+
+    fake_service = SimpleNamespace(
+        knowledge_base=SimpleNamespace(ingest=qdrant_unavailable),
+    )
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        api_key=None,
+        database_url=None,
+        qdrant_url=None,
+        user_key_encryption_key=None,
+        oidc_issuer_url=None,
+        oidc_jwks_url=None,
+        openai_api_key="test-key",
+    )
+    with (
+        patch("rag_pipeline.api.OpenAIEmbeddingProvider", return_value=object()),
+        TestClient(create_app(settings=settings, service=fake_service)) as client,
+    ):
+        response = client.post(
+            "/v1/ingest",
+            files={"file": ("policy.txt", b"Policy text")},
+        )
+
+    assert response.status_code == 503
 
 
 # Verify dense and sparse retrieval both return persisted chunks for supported query terms.
@@ -1164,7 +1606,14 @@ def test_graph_clients_are_built_with_the_callers_key(monkeypatch):
             self.api_key = api_key
 
     class FakeRetriever:
-        def __init__(self, _knowledge_base, embeddings, _settings, _reranker):
+        def __init__(
+            self,
+            _knowledge_base,
+            embeddings,
+            _settings,
+            _reranker,
+            **_store_options,
+        ):
             self.embeddings = embeddings
 
     def fake_build_graph(retriever, generator, *_args, **_kwargs):
