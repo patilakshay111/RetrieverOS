@@ -137,30 +137,29 @@ These diagrams follow the implemented ingestion and question-answering paths. Th
 ### Ingestion and index publication
 
 ```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
 flowchart TD
-    upload["Document upload"] --> apiIngest["POST /v1/ingest<br/>API-key check and request-size limits"]
-    sample["Bundled sample files"] --> seed["seed.py"]
-    archive["Archived raw files listed in the active manifest"] --> reindex["reindex.py<br/>verify SHA-256 before re-ingestion"]
-    apiIngest --> ingest["KnowledgeBase.ingest"]
+    upload["Document upload"] --> api["POST /v1/ingest"]
+    samples["Sample documents"] --> seed["seed.py"]
+    archive["Archived documents"] --> reindex["reindex.py<br/>verify source hash"]
+    api --> ingest["Parse and chunk<br/>selected strategy"]
     seed --> ingest
     reindex --> ingest
+    ingest --> embed["Embed chunks<br/>configured OpenAI model"]
+    embed --> dedupe["Deduplicate and replace<br/>this source's chunks"]
+    dedupe --> stage["Write complete staged<br/>index generation"]
+    stage --> publish["Atomically publish<br/>index/CURRENT"]
+    publish --> active["Active index snapshot"]
 
-    ingest --> digest["Compute source SHA-256"]
-    digest --> raw["Save original bytes in DATA_DIR/raw<br/>content-addressed safe filename"]
-    raw --> parse["Extract Markdown, text, HTML, or PDF<br/>sections with heading/page metadata"]
-    parse --> strategy{"Selected chunking strategy"}
-    strategy --> fixed["Fixed recursive character splitting"]
-    strategy --> recursive["Heading-aware recursive splitting"]
-    strategy --> semantic["Semantic splitting<br/>sentence embeddings compare adjacent sentences"]
-    fixed --> drafts["Chunk drafts retain heading/page metadata"]
-    recursive --> drafts
-    semantic --> drafts
-    drafts --> embed["Embed chunk texts in batches<br/>normalize vectors"]
-    embed --> dedup["Skip near-duplicates against retained<br/>and newly accepted chunks"]
-    dedup --> replace["Replace prior chunks for this source;<br/>retain other indexed sources"]
-    replace --> stage["Write a complete staged generation:<br/>chunks.json, vectors.npy, documents.json,<br/>dense.faiss (when non-empty)"]
-    stage --> publish["Atomically replace index/CURRENT"]
-    publish --> active["In-memory active snapshot"]
+    classDef input fill:#0d1b2a,stroke:#4cc9f0,color:#ffffff;
+    classDef process fill:#1b263b,stroke:#4cc9f0,color:#ffffff;
+    classDef storage fill:#0d1b2a,stroke:#ffd166,color:#ffffff;
+    classDef provider fill:#1b263b,stroke:#06d6a0,color:#ffffff;
+
+    class upload,samples,archive input;
+    class api,seed,reindex,ingest,dedupe process;
+    class stage,publish,active storage;
+    class embed provider;
 ```
 
 `seed.py` feeds the bundled sample files into the same ingestion method. `reindex.py` reads only documents in the active manifest, verifies each archived source digest, and re-ingests it using its recorded strategy unless another is selected. An ingestion failure does not switch the `CURRENT` pointer to an incomplete generation.
@@ -168,38 +167,32 @@ flowchart TD
 ### Question answering
 
 ```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
 flowchart TD
-    client["Streamlit dashboard or API client"] --> endpoint["POST /v1/ask<br/>request validation and API-key check"]
-    endpoint --> runtime["Get or lazily initialize shared RAGService"]
-    runtime --> checkpoint["Load LangGraph state for thread_id<br/>MemorySaver checkpoint"]
-    checkpoint --> history["Build retrieval query from current question<br/>and up to six recent history entries"]
-    history --> encode["Embed query with configured OpenAI embedding model"]
-
-    encode --> dense["Dense search: normalized query<br/>against active FAISS IndexFlatIP"]
-    dense --> mode{"Requested retrieval mode"}
-    mode -->|hybrid| sparse["BM25 search over active snapshot chunks<br/>build/cache model by snapshot generation"]
-    mode -->|sparse| sparse
-    mode -->|dense| denseRank["Dense rank ordering"]
-    sparse -->|hybrid mode| rrf["Weighted Reciprocal Rank Fusion"]
-    sparse -->|sparse mode| sparseRank["BM25 rank ordering"]
-    rrf --> candidates["Select rerank candidates"]
-    denseRank --> candidates
-    sparseRank --> candidates
-    candidates --> reranker{"Reranker configured?"}
-    reranker -->|yes| rerank["Cross-encoder reranks candidates"]
-    reranker -->|no| top["Keep final top chunks"]
-    rerank --> top
-    top --> confidence["Calculate retrieval confidence"]
-    confidence --> gate{"Below minimum retrieval confidence?"}
-
-    gate -->|yes| abstain["Return insufficient-context answer<br/>and documents to check"]
-    gate -->|no| generate["Generate answer grounded in numbered retrieved chunks<br/>with recent conversation context"]
-    generate --> citations["Verify cited claims against referenced chunks"]
-    citations --> completeness["Assess answer completeness"]
-    abstain --> score["Calculate final confidence<br/>and append turn to conversation history"]
+    client["Streamlit or API client"] --> ask["POST /v1/ask"]
+    ask --> graph["RAGService / LangGraph<br/>load thread history"]
+    graph --> query["Build query from question<br/>and recent history"]
+    query --> retrieve["Retrieve evidence<br/>FAISS, BM25, or hybrid RRF"]
+    retrieve --> rerank["Optional cross-encoder reranking"]
+    rerank --> gate{"Retrieval confidence<br/>below threshold?"}
+    gate -->|Yes| abstain["Return insufficient-context answer"]
+    gate -->|No| answer["Generate grounded answer<br/>OpenAI"]
+    answer --> citations["Verify cited claims<br/>LLM judge"]
+    citations --> completeness["Assess completeness<br/>LLM judge"]
+    abstain --> score["Calculate final confidence locally<br/>append turn to history"]
     completeness --> score
-    score --> response["Return answer, citations, retrieved chunks,<br/>confidence breakdown and thread_id"]
+    score --> response["Return answer, evidence,<br/>citations, scores, thread_id"]
     response --> client
+
+    classDef client fill:#0d1b2a,stroke:#4cc9f0,color:#ffffff;
+    classDef service fill:#1b263b,stroke:#4cc9f0,color:#ffffff;
+    classDef decision fill:#0d1b2a,stroke:#ffd166,color:#ffffff;
+    classDef provider fill:#1b263b,stroke:#06d6a0,color:#ffffff;
+
+    class client,response client;
+    class ask,graph,query,retrieve,rerank,abstain,score service;
+    class gate decision;
+    class answer,citations,completeness provider;
 ```
 
 For low retrieval confidence, the graph skips answer generation, citation verification, and completeness judging; it returns an insufficient-context response instead. Otherwise, the confidence score combines retrieval confidence, citation coverage, and the completeness assessment. `POST /v1/compare` runs this answering path twice, once in hybrid mode and once in dense-only mode, using separate `-hybrid` and `-dense` thread IDs.
