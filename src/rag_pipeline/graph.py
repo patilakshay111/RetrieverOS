@@ -7,11 +7,13 @@ from langgraph.graph import END, StateGraph
 
 from rag_pipeline.config import Settings
 from rag_pipeline.generation import insufficient_context_answer
-from rag_pipeline.models import AnswerState, CitationCheck, RetrievedChunk
+from rag_pipeline.models import AccessContext, AnswerState, CitationCheck, RetrievedChunk
 
 
 class Retriever(Protocol):
-    def search(self, query: str, mode: str) -> tuple[list[RetrievedChunk], float]: ...
+    def search(
+        self, query: str, mode: str, access_context: AccessContext | None = None
+    ) -> tuple[list[RetrievedChunk], float]: ...
 
 
 class Generator(Protocol):
@@ -37,11 +39,14 @@ def build_graph(
     generator: Generator,
     settings: Settings,
     use_memory_saver: bool = True,
+    checkpointer=None,
 ):
     # Retrieve only the chunks relevant to the current question.
     def retrieve(state: AnswerState) -> dict:
         retrieval_query = "\n".join([*state.history[-6:], f"Current question: {state.question}"])
-        chunks, confidence = retriever.search(retrieval_query, state.retrieval_mode)
+        chunks, confidence = retriever.search(
+            retrieval_query, state.retrieval_mode, state.access_context
+        )
         return {
             "retrieved_chunks": chunks,
             "retrieval_confidence": confidence,
@@ -101,4 +106,7 @@ def build_graph(
     graph.add_edge("verify", "score")
     graph.add_edge("score", END)
     graph.set_entry_point("retrieve")
-    return graph.compile(checkpointer=MemorySaver() if use_memory_saver else None)
+    saver = checkpointer if checkpointer is not None else (
+        MemorySaver() if use_memory_saver else None
+    )
+    return graph.compile(checkpointer=saver)

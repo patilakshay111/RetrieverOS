@@ -3,7 +3,7 @@
 from rag_pipeline.config import Settings
 from rag_pipeline.generation import AnswerGenerator
 from rag_pipeline.graph import build_graph
-from rag_pipeline.models import CitationCheck, RetrievedChunk
+from rag_pipeline.models import AccessContext, CitationCheck, RetrievedChunk
 from rag_pipeline.service import RAGService
 
 
@@ -27,9 +27,12 @@ class _LazyRetriever:
         self.runtime = runtime
 
     def search(
-        self, query: str, mode: str = "hybrid"
+        self,
+        query: str,
+        mode: str = "hybrid",
+        access_context: AccessContext | None = None,
     ) -> tuple[list[RetrievedChunk], float]:
-        return self.runtime.get_service().retriever.search(query, mode)
+        return self.runtime.get_service().retriever.search(query, mode, access_context)
 
 
 class _LazyGenerator:

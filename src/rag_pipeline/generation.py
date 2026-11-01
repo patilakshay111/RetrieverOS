@@ -30,10 +30,10 @@ class QualityVerdict(BaseModel):
 # Initialize the generation client and two explicit structured-output judges.
 class AnswerGenerator:
     # Construct one reusable deterministic model client with citation and completeness judges.
-    def __init__(self, settings: Settings):
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is required for answer generation.")
-        self.client = llm()
+    def __init__(self, settings: Settings, api_key: str | None = None):
+        if not api_key and not settings.openai_api_key:
+            raise RuntimeError("An OpenAI API key is required for answer generation.")
+        self.client = llm(settings, api_key)
         self.citation_judge = self.client.with_structured_output(CitationVerdict)
         self.completeness_judge = self.client.with_structured_output(CompletenessVerdict)
         self.quality_judge = self.client.with_structured_output(QualityVerdict)

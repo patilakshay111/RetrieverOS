@@ -10,6 +10,77 @@ The workflow is implemented as a LangGraph `StateGraph` with Pydantic state and 
 
 Contributions and issue reports are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development and pull request workflow.
 
+## Local multi-service stack
+
+The Compose file starts the API and dashboard plus local Postgres, Redis,
+Qdrant, Keycloak, and Mailpit services. Generate local-only service passwords
+and an encryption key, then add your OpenAI key:
+
+```powershell
+python scripts/init_local_env.py
+notepad .env
+docker compose up --build
+```
+
+The dashboard is at <http://localhost:8501>, the API at
+<http://localhost:8000/docs>, Keycloak at <http://localhost:8080>, and the
+Mailpit inbox at <http://localhost:8025>. All host ports bind to loopback.
+Docker Desktop (or another Docker Engine) must be running.
+Compose runs the Alembic database migration before starting the API.
+For an externally managed PostgreSQL database, run `alembic upgrade head`
+with that environment's `DATABASE_URL` before deploying the API.
+
+To turn on Keycloak login:
+
+1. Open the `hybrid-rag` realm in Keycloak. Create a confidential OIDC client
+   named `hybrid-rag-dashboard` with standard flow enabled and redirect URI
+   `http://localhost:8501/oauth2callback`. Copy its generated client secret
+   into a local `.streamlit/secrets.toml`, using
+   `.streamlit/secrets.toml.example` as the template. Generate a unique
+   `cookie_secret`; do not use the example value.
+2. Add an audience mapper to the client so its access tokens include
+   `hybrid-rag-api` in `aud`.
+3. Set `OIDC_ISSUER_URL=http://localhost:8080/realms/hybrid-rag`,
+   `OIDC_JWKS_URL=http://keycloak:8080/realms/hybrid-rag/protocol/openid-connect/certs`,
+   and `STREAMLIT_OIDC_ENABLED=true` in `.env`, then restart the stack.
+4. Open registration requires email verification. Local verification and
+   password-reset messages appear in Mailpit. To enable Google login, configure
+   a Google identity provider in the Keycloak realm with OAuth credentials
+   created in your own Google Cloud project; never put those credentials in
+   source control or this chat.
+
+The API verifies Keycloak access-token signatures, issuer, audience, expiry,
+workspace, and role claims. If a signed token has no `workspace_id` claim, its
+personal workspace is derived from its immutable subject ID. The imported realm
+assigns the `employee`, `hr`, `ceo`, `admin`, and `platform-admin` realm roles.
+For an organization workspace, a Keycloak administrator must assign a
+workspace ID and the intended roles to each user. The API applies workspace,
+owner, and role ACL checks before returning documents or passing retrieved
+evidence to the answer graph. Conversation checkpoints are namespaced by user
+and workspace.
+
+With OIDC enabled, each user can save, rotate, or delete their own OpenAI key
+from the dashboard. The API encrypts keys in Postgres using
+`USER_KEY_ENCRYPTION_KEY`; generate a fresh key for every deployment and keep a
+secure backup, because losing it makes stored credentials undecryptable. Key
+plaintext is not returned by the API. In local development without OIDC, the
+legacy shared `OPENAI_API_KEY` remains available.
+
+**This is an in-progress local security foundation, not a production-ready
+deployment.** The current vector path still uses local FAISS and conversation
+checkpoints remain in memory. Redis and Qdrant start in Compose but are not yet
+used by the application; workspace invitation and role management still use
+Keycloak administration rather than an in-app control panel. The approved
+next step is to replace Streamlit with a React/Vite dashboard while retaining
+FastAPI. OpenTelemetry, authorization-scoped FAQ caching, and deployment
+automation also remain to be implemented and validated. Kubernetes is out of
+scope. GitHub Actions currently runs the offline tests, then validates Compose
+and builds the container image; it does not publish or deploy an image. The
+Compose stack has not been started in this environment because the Docker
+Engine is unavailable. Render will be tested after local implementation and
+validation. Do not expose this stack to the public internet or ingest
+confidential documents yet.
+
 ## Production data flow
 
 These diagrams follow the implemented ingestion and question-answering paths. The index is local FAISS; document embeddings and answer/judge calls use the configured OpenAI models. BM25 is rebuilt from the exact active chunk snapshot on the first sparse or hybrid search for that generation, then cached in process.
@@ -82,11 +153,20 @@ Use your installed global Python (3.11 or newer); this guide does not create a v
 ```powershell
 python --version
 python -m pip install -e ".[dev]"
-Copy-Item .env.example .env
+python scripts/init_local_env.py
 notepad .env
 ```
 
 In `.env`, set `OPENAI_API_KEY` to your real OpenAI API key. Keep `APP_ENV=development` for local use. `API_KEY` can remain blank for a local-only demo; if you set it, send the same value as `X-API-Key` when calling protected endpoints. Do not commit `.env`.
+For this native-Python setup (not Docker Compose), set SQLite as the local
+credential store in the API terminal before starting it:
+
+```powershell
+$env:DATABASE_URL = "sqlite:///./data/runtime/credentials.db"
+```
+
+Docker Compose overrides `DATABASE_URL` with its Postgres service address and
+runs migrations automatically.
 
 ### 1. Index the bundled sample documents
 
@@ -187,13 +267,20 @@ See the [project recreation guide](./docs/PROJECT_RECREATION_GUIDE.md) and [case
 
 ## API
 
-- `GET /healthz`: process health.
+- `GET /healthz`: process liveness.
+- `GET /readyz`: readiness, including configured credential-store availability.
 - `GET /v1/documents`: indexed document inventory.
 - `POST /v1/ingest`: multipart document upload and chunking strategy.
 - `POST /v1/ask`: grounded answer with citations, retrieved chunks, and confidence.
 - `POST /v1/compare`: hybrid and dense-only responses for the same question.
+- `GET`, `PUT`, `DELETE /v1/account/openai-key`: inspect whether the caller's
+  key is saved, encrypt and save/rotate it, or delete it.
 
-Set `API_KEY` to require `X-API-Key` authentication. Production startup requires both `API_KEY` (at least 32 characters) and `OPENAI_API_KEY`, and rejects wildcard CORS. Uploads are size-limited; raw uploads and immutable index generations are stored under `DATA_DIR`.
+For local development, set `API_KEY` to require `X-API-Key`. If
+`OIDC_ISSUER_URL` is configured, protected API routes require a verified bearer
+token instead. Production startup requires HTTPS OIDC, PostgreSQL, encrypted
+per-user key storage, and rejects wildcard CORS. Uploads are size-limited; raw
+uploads and immutable index generations are stored under `DATA_DIR`.
 
 ## Architecture notes
 
@@ -205,4 +292,5 @@ Set `API_KEY` to require `X-API-Key` authentication. Production startup requires
 - The default reranker is `cross-encoder/ms-marco-MiniLM-L-6-v2`. It loads on the first query and may need network access to download model weights; disable it for a lightweight offline test using `RERANKER_ENABLED=false`.
 - The sample corpus is synthetic. Do not ingest confidential material into a demo environment.
 
-The implementation uses local FAISS to keep the vector index self-contained and avoid a separate database service.
+The active application index remains local FAISS; the Compose Qdrant service is
+not yet connected to retrieval.

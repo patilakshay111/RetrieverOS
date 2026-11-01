@@ -9,6 +9,13 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY src ./src
 COPY data ./data
-RUN pip install --upgrade pip && pip install .
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
+RUN pip install --upgrade pip && pip install . \
+    && useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/data/runtime \
+    && chown -R appuser:appuser /app
+
+USER 10001:10001
 
 EXPOSE 8000 8501

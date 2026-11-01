@@ -14,6 +14,23 @@ st.title("Internal documentation Q&A")
 st.caption("Hybrid dense + BM25 retrieval, verified citations, and transparent confidence scores.")
 api_url = os.getenv("STREAMLIT_API_URL", "http://localhost:8000").rstrip("/")
 st.sidebar.caption(f"API endpoint: {api_url}")
+oidc_enabled = os.getenv("STREAMLIT_OIDC_ENABLED", "false").strip().lower() == "true"
+access_token = ""
+
+if oidc_enabled:
+    if not st.user.is_logged_in:
+        st.title("Sign in to Hybrid RAG Studio")
+        if st.button("Continue to sign in", type="primary"):
+            st.login("keycloak")
+        st.stop()
+    try:
+        access_token = st.user.tokens["access"]
+    except (AttributeError, KeyError, TypeError):
+        st.error("OIDC is enabled, but the access token is not exposed to the app.")
+        st.stop()
+    st.sidebar.caption(f"Signed in as {st.user.get('email', 'user')}")
+    if st.sidebar.button("Sign out"):
+        st.logout()
 
 # Prefer Streamlit-managed secrets and use deployment environment variables as a fallback.
 def _configured_api_key() -> str:
@@ -32,17 +49,75 @@ for state_key, default in {
     if state_key not in st.session_state:
         st.session_state[state_key] = default
 
-api_key = st.sidebar.text_input("API key", value=_configured_api_key(), type="password")
+api_key = (
+    ""
+    if oidc_enabled
+    else st.sidebar.text_input("API key", value=_configured_api_key(), type="password")
+)
+
+
+def _request_headers() -> dict[str, str]:
+    if access_token:
+        return {"Authorization": f"Bearer {access_token}"}
+    return {"X-API-Key": api_key} if api_key else {}
 
 
 # Send a JSON request with the configured API key and report HTTP failures explicitly.
 def _post(path: str, payload: dict):
-    headers = {"X-API-Key": api_key} if api_key else {}
     response = requests.post(
-        f"{api_url}{path}", json=payload, headers=headers, timeout=(5, 180)
+        f"{api_url}{path}", json=payload, headers=_request_headers(), timeout=(5, 180)
     )
     response.raise_for_status()
     return response.json()
+
+
+# Manage only this signed-in user's encrypted OpenAI key; never display saved values.
+if os.getenv("STREAMLIT_USER_KEYS_ENABLED", "false").strip().lower() == "true":
+    with st.sidebar.expander("OpenAI API key"):
+        try:
+            status_response = requests.get(
+                f"{api_url}/v1/account/openai-key",
+                headers=_request_headers(),
+                timeout=10,
+            )
+            status_response.raise_for_status()
+            configured_key = status_response.json()["configured"]
+            st.caption("A key is saved for your account." if configured_key else "No key saved.")
+        except requests.RequestException as error:
+            configured_key = False
+            st.error(f"Could not check your saved key: {error}")
+        with st.form("openai_key_form", clear_on_submit=True):
+            submitted_key = st.text_input("OpenAI API key", type="password")
+            save_key = st.form_submit_button("Save or replace key")
+        if save_key:
+            try:
+                response = requests.put(
+                    f"{api_url}/v1/account/openai-key",
+                    json={"api_key": submitted_key},
+                    headers=_request_headers(),
+                    timeout=15,
+                )
+                response.raise_for_status()
+                st.success("Your key was encrypted and saved.")
+                st.rerun()
+            except requests.RequestException as error:
+                st.error(f"Could not save your key: {error}")
+                if error.response is not None:
+                    st.code(error.response.text)
+        if configured_key and st.button("Delete saved key", key="delete_openai_key"):
+            try:
+                response = requests.delete(
+                    f"{api_url}/v1/account/openai-key",
+                    headers=_request_headers(),
+                    timeout=15,
+                )
+                response.raise_for_status()
+                st.success("Your saved key was deleted.")
+                st.rerun()
+            except requests.RequestException as error:
+                st.error(f"Could not delete your key: {error}")
+                if error.response is not None:
+                    st.code(error.response.text)
 
 
 # Batch question entry and retrieval mode selection into one form submission.
@@ -127,9 +202,10 @@ if st.session_state.last_result is not None:
 
 # Let reviewers inspect the documents currently present in the local index.
 if st.sidebar.button("Refresh indexed documents"):
-    headers = {"X-API-Key": api_key} if api_key else {}
     try:
-        response = requests.get(f"{api_url}/v1/documents", headers=headers, timeout=15)
+        response = requests.get(
+            f"{api_url}/v1/documents", headers=_request_headers(), timeout=15
+        )
         response.raise_for_status()
         st.sidebar.json(response.json())
     except requests.RequestException as error:

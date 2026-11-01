@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -33,6 +34,11 @@ class Settings:
     chat_model: str
     embedding_model: str
     api_key: str | None
+    oidc_issuer_url: str | None
+    oidc_jwks_url: str | None
+    oidc_audience: str
+    database_url: str | None
+    user_key_encryption_key: str | None
     data_dir: Path
     chunk_size: int
     chunk_overlap: int
@@ -60,6 +66,11 @@ class Settings:
             chat_model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
             embedding_model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
             api_key=os.getenv("API_KEY") or None,
+            oidc_issuer_url=os.getenv("OIDC_ISSUER_URL") or None,
+            oidc_jwks_url=os.getenv("OIDC_JWKS_URL") or None,
+            oidc_audience=os.getenv("OIDC_AUDIENCE", "hybrid-rag-api"),
+            database_url=os.getenv("DATABASE_URL") or None,
+            user_key_encryption_key=os.getenv("USER_KEY_ENCRYPTION_KEY") or None,
             data_dir=Path(os.getenv("DATA_DIR", "data/runtime")).expanduser(),
             chunk_size=int(os.getenv("CHUNK_SIZE", "900")),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "150")),
@@ -119,9 +130,31 @@ class Settings:
 
     # Prevent an accidentally public API or unconfigured production model from starting.
     def validate_production(self) -> None:
-        if self.app_env == "production" and not self.api_key:
-            raise ValueError("API_KEY is required when APP_ENV=production.")
+        if self.app_env == "production" and not self.oidc_issuer_url:
+            raise ValueError("OIDC_ISSUER_URL is required when APP_ENV=production.")
+        if (
+            self.app_env == "production"
+            and self.oidc_issuer_url
+            and urlparse(self.oidc_issuer_url).scheme != "https"
+        ):
+            raise ValueError("Production OIDC_ISSUER_URL must use HTTPS.")
         if self.app_env == "production" and self.api_key and len(self.api_key) < 32:
             raise ValueError("Production API_KEY must contain at least 32 characters.")
-        if self.app_env == "production" and not self.openai_api_key:
-            raise ValueError("OPENAI_API_KEY is required when APP_ENV=production.")
+        if self.app_env == "production" and self.oidc_issuer_url and not self.oidc_audience.strip():
+            raise ValueError("OIDC_AUDIENCE is required when OIDC authentication is enabled.")
+        if self.app_env == "production" and not self.database_url:
+            raise ValueError("DATABASE_URL is required when APP_ENV=production.")
+        if (
+            self.app_env == "production"
+            and self.database_url
+            and not self.database_url.startswith(("postgresql://", "postgresql+"))
+        ):
+            raise ValueError("Production DATABASE_URL must use PostgreSQL.")
+        if self.app_env == "production" and not self.user_key_encryption_key:
+            raise ValueError("USER_KEY_ENCRYPTION_KEY is required when APP_ENV=production.")
+        if self.app_env == "production" and not self.openai_api_key and not (
+            self.database_url and self.user_key_encryption_key
+        ):
+            raise ValueError(
+                "Production requires OPENAI_API_KEY or encrypted per-user key storage."
+            )

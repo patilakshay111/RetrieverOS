@@ -19,7 +19,7 @@ from rag_pipeline.chunking import ChunkStrategy, chunk_sections
 from rag_pipeline.config import Settings
 from rag_pipeline.documents import load_document
 from rag_pipeline.embeddings import EmbeddingProvider
-from rag_pipeline.models import Chunk, DocumentInfo, IngestionResult
+from rag_pipeline.models import AccessContext, Chunk, DocumentInfo, IngestionResult
 
 
 # Keep each active index generation internally consistent across its chunk and vector files.
@@ -35,7 +35,7 @@ class IndexSnapshot:
 # Manage the raw source archive and immutable, atomically published index generations.
 class KnowledgeBase:
     # Load the current snapshot or initialize an empty, local FAISS corpus.
-    def __init__(self, settings: Settings, embeddings: EmbeddingProvider):
+    def __init__(    self, settings: Settings, embeddings: EmbeddingProvider | None):
         self.settings = settings
         self.embeddings = embeddings
         self.root = settings.data_dir
@@ -64,7 +64,8 @@ class KnowledgeBase:
         try:
             chunks = [Chunk.model_validate(item) for item in self._read_json(directory / "chunks.json")]
             documents = {
-                item["source"]: DocumentInfo.model_validate(item)
+                self._document_key(item.get("workspace_id", "local"), item["source"]):
+                DocumentInfo.model_validate(item)
                 for item in self._read_json(directory / "documents.json")
             }
             vectors = np.load(directory / "vectors.npy", allow_pickle=False).astype(np.float32)
@@ -76,6 +77,10 @@ class KnowledgeBase:
         if chunks and (dense_index is None or dense_index.ntotal != len(chunks)):
             raise RuntimeError("Persisted chunks and FAISS index are inconsistent.")
         return IndexSnapshot(generation, chunks, vectors, dense_index, documents)
+
+    @staticmethod
+    def _document_key(workspace_id: str, source: str) -> str:
+        return f"{workspace_id}\x00{source}"
 
     # Return the current immutable generation for lock-free concurrent reads.
     def snapshot(self) -> IndexSnapshot:
@@ -147,10 +152,34 @@ class KnowledgeBase:
         return IndexSnapshot(generation, chunks, vectors, index, documents)
 
     # Replace one named document, chunk it, skip near-duplicates, and commit both indexes together.
-    def ingest(self, filename: str, content: bytes, strategy: ChunkStrategy) -> IngestionResult:
+    def ingest(
+        self,
+        filename: str,
+        content: bytes,
+        strategy: ChunkStrategy,
+        access_context: AccessContext | None = None,
+        required_roles: list[str] | None = None,
+        embeddings: EmbeddingProvider | None = None,
+    ) -> IngestionResult:
         if not content:
             raise ValueError("The uploaded document is empty.")
+        context = access_context or AccessContext(
+            user_id="local", workspace_id="local", roles=frozenset({"admin"})
+        )
+        roles = sorted(set(required_roles or []))
+        document_key = self._document_key(context.workspace_id, filename)
+        old_document = self._snapshot.documents.get(document_key)
+        if (
+            old_document is not None
+            and not context.platform_admin
+            and "admin" not in context.roles
+            and old_document.owner_id != context.user_id
+        ):
+            raise PermissionError("Only the document owner or a workspace admin may replace it.")
         digest = hashlib.sha256(content).hexdigest()
+        embedder = embeddings or self.embeddings
+        if embedder is None:
+            raise RuntimeError("An OpenAI embedding provider is required for ingestion.")
         self._save_raw(filename, digest, content)
         sections = load_document(filename, content)
         drafts = chunk_sections(
@@ -159,22 +188,38 @@ class KnowledgeBase:
             self.settings.chunk_size,
             self.settings.chunk_overlap,
             self.settings.semantic_similarity_threshold,
-            self.embeddings.embed_documents,
+            embedder.embed_documents,
         )
         drafts = [draft for draft in drafts if draft.text.strip()]
         if not drafts:
             raise ValueError("The document contains no extractable text.")
         with self._write_lock:
             previous = self._snapshot
-            retained = [chunk for chunk in previous.chunks if chunk.source != filename]
+            old_document = previous.documents.get(document_key)
+            if (
+                old_document is not None
+                and not context.platform_admin
+                and "admin" not in context.roles
+                and old_document.owner_id != context.user_id
+            ):
+                raise PermissionError("Only the document owner or a workspace admin may replace it.")
+            retained = [
+                chunk
+                for chunk in previous.chunks
+                if not (
+                    chunk.workspace_id == context.workspace_id and chunk.source == filename
+                )
+            ]
             retained_indices = [
-                index for index, chunk in enumerate(previous.chunks) if chunk.source != filename
+                index
+                for index, chunk in enumerate(previous.chunks)
+                if not (chunk.workspace_id == context.workspace_id and chunk.source == filename)
             ]
             retained_vectors = previous.vectors[retained_indices] if retained_indices else np.empty(
                 (0, previous.vectors.shape[1] if previous.vectors.ndim == 2 else 0),
                 dtype=np.float32,
             )
-            new_vectors = self.embeddings.embed_documents([draft.text for draft in drafts])
+            new_vectors = embedder.embed_documents([draft.text for draft in drafts])
             if new_vectors.ndim != 2 or new_vectors.shape[0] != len(drafts):
                 raise ValueError("Embedding provider returned an invalid document-vector matrix.")
             if len(retained_vectors) and retained_vectors.shape[1] != new_vectors.shape[1]:
@@ -182,9 +227,16 @@ class KnowledgeBase:
             normalized_new = np.ascontiguousarray(new_vectors, dtype=np.float32)
             faiss.normalize_L2(normalized_new)
             existing_index = None
-            if len(retained_vectors):
+            dedupe_indices = [
+                index
+                for index, chunk in enumerate(retained)
+                if chunk.workspace_id == context.workspace_id
+                and chunk.owner_id == context.user_id
+                and chunk.required_roles == roles
+            ]
+            if dedupe_indices:
                 normalized_retained = np.ascontiguousarray(
-                    retained_vectors, dtype=np.float32
+                    retained_vectors[dedupe_indices], dtype=np.float32
                 ).copy()
                 faiss.normalize_L2(normalized_retained)
                 existing_index = faiss.IndexFlatIP(int(normalized_retained.shape[1]))
@@ -207,7 +259,10 @@ class KnowledgeBase:
                         continue
                 chunk_index = len(accepted_chunks)
                 chunk_id = hashlib.sha256(
-                    f"{digest}:{strategy}:{chunk_index}:{draft.text}".encode("utf-8")
+                    (
+                        f"{context.workspace_id}:{context.user_id}:{digest}:"
+                        f"{strategy}:{chunk_index}:{draft.text}"
+                    ).encode("utf-8")
                 ).hexdigest()
                 accepted_chunks.append(
                     Chunk(
@@ -220,6 +275,9 @@ class KnowledgeBase:
                         page_number=draft.page_number,
                         chunking_strategy=strategy,
                         character_count=len(draft.text),
+                        workspace_id=context.workspace_id,
+                        owner_id=context.user_id,
+                        required_roles=roles,
                     )
                 )
                 accepted_vectors.append(vector[0].copy())
@@ -237,9 +295,7 @@ class KnowledgeBase:
             else:
                 all_vectors = retained_vectors.astype(np.float32, copy=False)
             documents = {
-                source: info
-                for source, info in previous.documents.items()
-                if source != filename
+                key: info for key, info in previous.documents.items() if key != document_key
             }
             document = DocumentInfo(
                 source=filename,
@@ -248,8 +304,11 @@ class KnowledgeBase:
                 chunk_count=len(accepted_chunks),
                 chunking_strategy=strategy,
                 ingested_at=datetime.now(timezone.utc).isoformat(),
+                workspace_id=context.workspace_id,
+                owner_id=context.user_id,
+                required_roles=roles,
             )
-            documents[filename] = document
+            documents[document_key] = document
             snapshot = self._commit(all_chunks, all_vectors, documents)
             self._snapshot = snapshot
             return IngestionResult(
@@ -259,5 +318,16 @@ class KnowledgeBase:
             )
 
     # Return the document inventory in stable source-name order.
-    def list_documents(self) -> list[DocumentInfo]:
-        return sorted(self._snapshot.documents.values(), key=lambda item: item.source.casefold())
+    def list_documents(
+        self, access_context: AccessContext | None = None
+    ) -> list[DocumentInfo]:
+        documents = self._snapshot.documents.values()
+        if access_context is not None:
+            documents = (
+                document
+                for document in documents
+                if access_context.permits(
+                    document.workspace_id, document.owner_id, document.required_roles
+                )
+            )
+        return sorted(documents, key=lambda item: item.source.casefold())

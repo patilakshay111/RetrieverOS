@@ -1,0 +1,27 @@
+{
+  "realm": "hybrid-rag",
+  "enabled": true,
+  "displayName": "Hybrid RAG Studio",
+  "sslRequired": "none",
+  "registrationAllowed": true,
+  "registrationEmailAsUsername": true,
+  "loginWithEmailAllowed": true,
+  "resetPasswordAllowed": true,
+  "verifyEmail": true,
+  "roles": {
+    "realm": [
+      { "name": "employee" },
+      { "name": "hr" },
+      { "name": "ceo" },
+      { "name": "admin" },
+      { "name": "platform-admin" }
+    ]
+  },
+  "defaultRoles": ["employee"],
+  "smtpServer": {
+    "host": "mailpit",
+    "port": "1025",
+    "from": "no-reply@hybrid-rag.local",
+    "fromDisplayName": "Hybrid RAG Studio"
+  }
+}

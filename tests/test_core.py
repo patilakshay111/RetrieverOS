@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 
 import numpy as np
+import pytest
 
 from rag_pipeline.chunking import chunk_sections
 from rag_pipeline.config import Settings
@@ -69,7 +70,7 @@ class FakeGraphRetriever:
         self.confidence = confidence
 
     # Return one local chunk for every query.
-    def search(self, question, mode):
+    def search(self, question, mode, access_context=None):
         chunk = Chunk(
             chunk_id="graph",
             text="The service retains logs for 30 days.",
@@ -177,6 +178,113 @@ def test_ingestion_deduplicates_and_reloads_consistent_snapshot(tmp_path):
     assert {item.source for item in reloaded.list_documents()} == {"policy.md", "copy.md"}
 
 
+# Verify identical filenames remain isolated by workspace and document role.
+def test_document_acl_filters_workspace_and_role_access(tmp_path):
+    from rag_pipeline.models import AccessContext
+
+    settings = replace(
+        Settings.from_env(),
+        data_dir=tmp_path,
+        reranker_enabled=False,
+        chunk_size=1000,
+        chunk_overlap=0,
+    )
+    knowledge_base = KnowledgeBase(settings, FakeEmbeddings())
+    hr = AccessContext(user_id="hr-user", workspace_id="workspace-a", roles=frozenset({"hr"}))
+    employee = AccessContext(
+        user_id="employee-user", workspace_id="workspace-a", roles=frozenset({"employee"})
+    )
+    other_workspace = AccessContext(
+        user_id="other-user", workspace_id="workspace-b", roles=frozenset({"hr"})
+    )
+    knowledge_base.ingest(
+        "policy.md", b"# HR\nCompensation data is confidential.", "recursive", hr, ["hr"]
+    )
+    knowledge_base.ingest(
+        "policy.md", b"# Employee\nOffice hours are 9 to 5.", "recursive", other_workspace, ["hr"]
+    )
+
+    assert [doc.workspace_id for doc in knowledge_base.list_documents(hr)] == ["workspace-a"]
+    assert knowledge_base.list_documents(employee) == []
+    assert [doc.workspace_id for doc in knowledge_base.list_documents(other_workspace)] == [
+        "workspace-b"
+    ]
+    assert len(knowledge_base.snapshot().documents) == 2
+
+
+# Verify a non-owner cannot replace another user's document in the same workspace.
+def test_document_acl_blocks_unauthorized_replacement_before_embedding(tmp_path):
+    from rag_pipeline.models import AccessContext
+
+    settings = replace(
+        Settings.from_env(),
+        data_dir=tmp_path,
+        reranker_enabled=False,
+        chunk_size=1000,
+        chunk_overlap=0,
+    )
+    embeddings = FakeEmbeddings()
+    knowledge_base = KnowledgeBase(settings, embeddings)
+    owner = AccessContext(user_id="owner", workspace_id="workspace-a", roles=frozenset({"hr"}))
+    intruder = AccessContext(
+        user_id="intruder", workspace_id="workspace-a", roles=frozenset({"employee"})
+    )
+    knowledge_base.ingest("policy.md", b"# Policy\nOriginal document.", "recursive", owner, ["hr"])
+
+    class NoEmbeddingCalls:
+        def embed_documents(self, _texts):
+            raise AssertionError("Unauthorized replacement must be rejected before embedding.")
+
+    knowledge_base.embeddings = NoEmbeddingCalls()
+    with pytest.raises(PermissionError):
+        knowledge_base.ingest(
+            "policy.md", b"# Policy\nReplacement document.", "recursive", intruder, ["employee"]
+        )
+    assert knowledge_base.list_documents(owner)[0].owner_id == "owner"
+
+
+# Verify dense and sparse retrieval never return evidence outside the caller's document ACL.
+def test_retrieval_excludes_documents_outside_workspace_and_roles(tmp_path):
+    from rag_pipeline.models import AccessContext
+
+    settings = replace(
+        Settings.from_env(),
+        data_dir=tmp_path,
+        reranker_enabled=False,
+        chunk_size=1000,
+        chunk_overlap=0,
+    )
+    embeddings = FakeEmbeddings()
+    knowledge_base = KnowledgeBase(settings, embeddings)
+    knowledge_base.ingest(
+        "hr.md",
+        b"# HR\nSalary bands and compensation details.",
+        "recursive",
+        AccessContext(user_id="hr", workspace_id="acme", roles=frozenset({"hr"})),
+        ["hr"],
+    )
+    knowledge_base.ingest(
+        "staff.md",
+        b"# Staff\nOffice holiday schedule for employees.",
+        "recursive",
+        AccessContext(user_id="staff", workspace_id="acme", roles=frozenset({"employee"})),
+        ["employee"],
+    )
+    retriever = HybridRetriever(knowledge_base, embeddings, settings)
+    caller = AccessContext(user_id="staff", workspace_id="acme", roles=frozenset({"employee"}))
+
+    for mode in ("dense", "sparse", "hybrid"):
+        results, _ = retriever.search("salary compensation", mode, caller)
+        assert all(item.chunk.workspace_id == "acme" for item in results)
+        assert all(
+            caller.permits(
+                item.chunk.workspace_id, item.chunk.owner_id, item.chunk.required_roles
+            )
+            for item in results
+        )
+        assert all(item.chunk.source != "hr.md" for item in results)
+
+
 # Verify dense and sparse retrieval both return persisted chunks for supported query terms.
 def test_dense_and_sparse_search_use_same_indexed_corpus(tmp_path):
     settings = replace(
@@ -247,29 +355,36 @@ def test_langgraph_abstains_when_retrieval_confidence_is_low():
     assert result.citation_checks == []
 
 
-# Verify production API configuration requires credentials and protects routes with an API key.
+# Verify production mode requires OIDC and rejects the legacy shared API-key login.
 def test_production_api_authentication():
     from fastapi.testclient import TestClient
     from types import SimpleNamespace
+    from cryptography.fernet import Fernet
+    from unittest.mock import patch
 
     from rag_pipeline.api import create_app
 
     settings = replace(
         Settings.from_env(),
         app_env="production",
-        api_key="test-key-that-is-at-least-thirty-two-characters",
+        api_key=None,
+        oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
         openai_api_key="test-openai-key",
+        database_url="postgresql+psycopg://user:password@localhost/test",
+        user_key_encryption_key=Fernet.generate_key().decode("ascii"),
     )
     fake_service = SimpleNamespace(
-        knowledge_base=SimpleNamespace(list_documents=lambda: [])
+        knowledge_base=SimpleNamespace(list_documents=lambda _access_context=None: [])
     )
-    client = TestClient(create_app(settings=settings, service=fake_service))
+    fake_store = SimpleNamespace(check=lambda: None)
+    with patch("rag_pipeline.api.UserCredentialStore", return_value=fake_store):
+        client = TestClient(create_app(settings=settings, service=fake_service))
     assert client.get("/healthz").status_code == 200
     assert client.get("/v1/documents").status_code == 401
     assert client.get(
         "/v1/documents",
         headers={"X-API-Key": "test-key-that-is-at-least-thirty-two-characters"},
-    ).json() == []
+    ).status_code == 401
     oversized = client.post(
         "/v1/ask",
         content=b"x" * (1024 * 1024 + 1),
@@ -279,3 +394,260 @@ def test_production_api_authentication():
         },
     )
     assert oversized.status_code == 413
+
+
+# Verify Keycloak tokens are checked cryptographically and yield only signed access claims.
+def test_oidc_verifier_validates_signature_issuer_audience_and_access_claims():
+    from datetime import datetime, timedelta, timezone
+
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from rag_pipeline.auth import OIDCVerifier
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    issuer = "https://identity.example.test/realms/hybrid-rag"
+    verifier = OIDCVerifier(issuer=issuer, audience="hybrid-rag-api")
+
+    class StaticSigningKey:
+        key = private_key.public_key()
+
+    class StaticJwks:
+        @staticmethod
+        def get_signing_key_from_jwt(_token):
+            return StaticSigningKey()
+
+    verifier.__dict__["jwks"] = StaticJwks()
+    now = datetime.now(timezone.utc)
+    claims = {
+        "iss": issuer,
+        "aud": "hybrid-rag-api",
+        "sub": "user-123",
+        "iat": now,
+        "exp": now + timedelta(minutes=5),
+        "workspace_id": "workspace-abc",
+        "roles": ["hr"],
+        "realm_access": {"roles": ["platform-admin"]},
+    }
+    token = jwt.encode(claims, private_key, algorithm="RS256")
+
+    context = verifier.verify(token)
+
+    assert context.user_id == "user-123"
+    assert context.workspace_id == "workspace-abc"
+    assert context.roles == {"hr"}
+    assert context.platform_admin
+
+    claims["aud"] = "different-api"
+    invalid_token = jwt.encode(claims, private_key, algorithm="RS256")
+    with pytest.raises(jwt.InvalidAudienceError):
+        verifier.verify(invalid_token)
+
+
+# Verify API keys are encrypted at rest and isolated to their user/workspace.
+def test_user_credential_store_encrypts_and_scopes_keys():
+    from cryptography.fernet import Fernet
+    from sqlalchemy.orm import Session
+
+    from rag_pipeline.credentials import UserCredentialStore, UserOpenAIKey
+
+    plaintext = "sk-test-user-specific-key-never-store-plaintext"
+    store = UserCredentialStore(
+        "sqlite:///:memory:", Fernet.generate_key().decode("ascii")
+    )
+    store.set_key("user-a", "workspace-a", plaintext)
+
+    assert store.has_key("user-a", "workspace-a")
+    assert store.get_key("user-a", "workspace-a") == plaintext
+    assert store.get_key("user-b", "workspace-a") is None
+    assert store.get_key("user-a", "workspace-b") is None
+    with Session(store._engine) as session:
+        encrypted = session.get(UserOpenAIKey, ("user-a", "workspace-a")).encrypted_key
+    assert plaintext.encode("utf-8") not in encrypted
+    store.delete_key("user-a", "workspace-a")
+    assert not store.has_key("user-a", "workspace-a")
+
+
+# Verify the checked-in migration creates the schema used by credential storage.
+def test_credential_schema_migration(tmp_path, monkeypatch):
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine, inspect
+
+    database_path = tmp_path / "migration.sqlite"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path.as_posix()}")
+    command.upgrade(Config("alembic.ini"), "head")
+
+    engine = create_engine(f"sqlite:///{database_path.as_posix()}")
+    tables = inspect(engine).get_table_names()
+    engine.dispose()
+
+    assert "user_openai_keys" in tables
+    assert "alembic_version" in tables
+
+
+# Verify the account API can save, report, and delete a user's encrypted key.
+def test_openai_key_account_endpoints():
+    from cryptography.fernet import Fernet
+    from fastapi.testclient import TestClient
+
+    from rag_pipeline.api import create_app
+
+    settings = replace(
+        Settings.from_env(),
+        database_url="sqlite:///:memory:",
+        user_key_encryption_key=Fernet.generate_key().decode("ascii"),
+    )
+    client = TestClient(create_app(settings=settings))
+    api_key = "sk-test-user-specific-key-never-return-it"
+
+    saved = client.put("/v1/account/openai-key", json={"api_key": api_key})
+    assert saved.status_code == 204
+    assert saved.text == ""
+    assert client.get("/v1/account/openai-key").json() == {"configured": True}
+    deleted = client.delete("/v1/account/openai-key")
+    assert deleted.status_code == 204
+    assert client.get("/v1/account/openai-key").json() == {"configured": False}
+
+
+# Verify the authenticated identity selects its own key before an ask reaches the service.
+def test_ask_uses_only_the_authenticated_users_openai_key():
+    from cryptography.fernet import Fernet
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+    from rag_pipeline.credentials import UserCredentialStore
+    from rag_pipeline.models import AccessContext, AnswerResponse
+
+    encryption_key = Fernet.generate_key().decode("ascii")
+    store = UserCredentialStore("sqlite:///:memory:", encryption_key)
+    identities = {
+        "alice-token": AccessContext(
+            user_id="alice", workspace_id="workspace-a", roles=frozenset({"employee"})
+        ),
+        "bob-token": AccessContext(
+            user_id="bob", workspace_id="workspace-a", roles=frozenset({"employee"})
+        ),
+    }
+
+    class StaticVerifier:
+        def verify(self, token: str) -> AccessContext:
+            return identities[token]
+
+    used_keys: list[str] = []
+
+    def ask(
+        question: str,
+        retrieval_mode: str,
+        thread_id: str,
+        _access_context: AccessContext,
+        api_key: str,
+    ) -> AnswerResponse:
+        used_keys.append(api_key)
+        return AnswerResponse(
+            question=question,
+            answer="Grounded answer.",
+            retrieval_mode=retrieval_mode,
+            citations=[],
+            retrieved_chunks=[],
+            confidence=0.0,
+            confidence_breakdown={},
+            insufficient_context=False,
+            documents_to_check=[],
+            thread_id=thread_id,
+        )
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="production",
+        api_key=None,
+        oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
+        openai_api_key=None,
+        database_url="postgresql+psycopg://user:password@localhost/test",
+        user_key_encryption_key=encryption_key,
+    )
+    fake_service = SimpleNamespace(ask=ask)
+    with (
+        patch("rag_pipeline.api.build_oidc_verifier", return_value=StaticVerifier()),
+        patch("rag_pipeline.api.UserCredentialStore", return_value=store),
+    ):
+        client = TestClient(create_app(settings=settings, service=fake_service))
+
+    alice_headers = {"Authorization": "Bearer alice-token"}
+    bob_headers = {"Authorization": "Bearer bob-token"}
+    alice_key = "sk-alice-specific-test-key"
+    saved = client.put(
+        "/v1/account/openai-key",
+        headers=alice_headers,
+        json={"api_key": alice_key},
+    )
+    assert saved.status_code == 204
+
+    request = {"question": "What does the document say?"}
+    assert client.post("/v1/ask", headers=bob_headers, json=request).status_code == 428
+    response = client.post("/v1/ask", headers=alice_headers, json=request)
+
+    assert response.status_code == 200
+    assert used_keys == [alice_key]
+    assert store.get_key("bob", "workspace-a") is None
+
+
+# Verify a per-user key is supplied to both embedding and answer-generation clients.
+def test_graph_clients_are_built_with_the_callers_key(monkeypatch):
+    from collections import OrderedDict
+    from threading import Lock
+    from types import SimpleNamespace
+
+    import rag_pipeline.service as service_module
+    from rag_pipeline.service import RAGService
+
+    received_embedding_keys: list[str] = []
+    received_generation_keys: list[str] = []
+
+    class FakeEmbeddingProvider:
+        def __init__(self, _settings, api_key: str):
+            received_embedding_keys.append(api_key)
+            self.api_key = api_key
+
+    class FakeGenerator:
+        def __init__(self, _settings, api_key: str):
+            received_generation_keys.append(api_key)
+            self.api_key = api_key
+
+    class FakeRetriever:
+        def __init__(self, _knowledge_base, embeddings, _settings, _reranker):
+            self.embeddings = embeddings
+
+    def fake_build_graph(retriever, generator, *_args, **_kwargs):
+        return SimpleNamespace(
+            embedding_key=retriever.embeddings.api_key,
+            generation_key=generator.api_key,
+        )
+
+    monkeypatch.setattr(service_module, "OpenAIEmbeddingProvider", FakeEmbeddingProvider)
+    monkeypatch.setattr(service_module, "AnswerGenerator", FakeGenerator)
+    monkeypatch.setattr(service_module, "HybridRetriever", FakeRetriever)
+    monkeypatch.setattr(service_module, "build_graph", fake_build_graph)
+
+    service = object.__new__(RAGService)
+    service.settings = Settings.from_env()
+    service.knowledge_base = object()
+    service._reranker = None
+    service._checkpointer = None
+    service.graph = None
+    service._graph_cache = OrderedDict()
+    service._graph_lock = Lock()
+
+    alice_graph = service._graph_for_key("alice-openai-key")
+    bob_graph = service._graph_for_key("bob-openai-key")
+
+    assert alice_graph.embedding_key == "alice-openai-key"
+    assert alice_graph.generation_key == "alice-openai-key"
+    assert bob_graph.embedding_key == "bob-openai-key"
+    assert bob_graph.generation_key == "bob-openai-key"
+    assert alice_graph is not bob_graph
+    assert service._graph_for_key("alice-openai-key") is alice_graph
+    assert received_embedding_keys == ["alice-openai-key", "bob-openai-key"]
+    assert received_generation_keys == ["alice-openai-key", "bob-openai-key"]

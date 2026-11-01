@@ -18,21 +18,26 @@ class EmbeddingProvider:
         raise NotImplementedError
 
 
-# Create the interview-rule one-line OpenAI chat helper for shared application use.
-def llm() -> ChatOpenAI: return ChatOpenAI(model=Settings.from_env().chat_model, temperature=0)
+# Create a chat client using the requesting user's key or the local default.
+def llm(settings: Settings, api_key: str | None = None) -> ChatOpenAI:
+    key = api_key or settings.openai_api_key
+    if not key:
+        raise RuntimeError("An OpenAI API key is required for model calls.")
+    return ChatOpenAI(model=settings.chat_model, temperature=0, api_key=key)
 
 
 # Wrap OpenAI's text-embedding-3-small-compatible endpoint behind the local interface.
 class OpenAIEmbeddingProvider(EmbeddingProvider):
     # Initialize the OpenAI embeddings client without embedding or downloading anything.
-    def __init__(self, settings: Settings):
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is required for embedding and generation.")
+    def __init__(self, settings: Settings, api_key: str | None = None):
+        key = api_key or settings.openai_api_key
+        if not key:
+            raise RuntimeError("An OpenAI API key is required for embeddings.")
         from langchain_openai import OpenAIEmbeddings
 
         self.client = OpenAIEmbeddings(
             model=settings.embedding_model,
-            api_key=settings.openai_api_key,
+            api_key=key,
         )
 
     # Embed documents in bounded batches to avoid oversized API requests.

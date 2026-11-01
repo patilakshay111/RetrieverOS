@@ -5,6 +5,22 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field
 
 
+class AccessContext(BaseModel):
+    user_id: str
+    workspace_id: str
+    roles: frozenset[str] = Field(default_factory=frozenset)
+    platform_admin: bool = False
+
+    def permits(self, workspace_id: str, owner_id: str, required_roles: list[str]) -> bool:
+        if self.platform_admin:
+            return True
+        if self.workspace_id != workspace_id:
+            return False
+        if "admin" in self.roles or owner_id == self.user_id:
+            return True
+        return bool(self.roles.intersection(required_roles))
+
+
 # Append new checkpoint history while retaining only the most recent 20 exchanges.
 def merge_history(previous: list[str], update: list[str]) -> list[str]:
     return (previous + update)[-40:]
@@ -21,6 +37,9 @@ class Chunk(BaseModel):
     page_number: int | None = None
     chunking_strategy: Literal["fixed", "recursive", "semantic"]
     character_count: int
+    workspace_id: str = "local"
+    owner_id: str = "local"
+    required_roles: list[str] = Field(default_factory=list)
 
 
 # Represent one ranked chunk and retain scores from each retrieval stage.
@@ -47,6 +66,7 @@ class AnswerState(BaseModel):
     question: str
     thread_id: str = "chat_session_1"
     retrieval_mode: Literal["hybrid", "dense", "sparse"] = "hybrid"
+    access_context: AccessContext | None = None
     history: Annotated[list[str], merge_history] = Field(default_factory=list)
     retrieved_chunks: list[RetrievedChunk] = Field(default_factory=list)
     answer: str = ""
@@ -81,6 +101,9 @@ class DocumentInfo(BaseModel):
     chunk_count: int
     chunking_strategy: str
     ingested_at: str
+    workspace_id: str = "local"
+    owner_id: str = "local"
+    required_roles: list[str] = Field(default_factory=list)
 
 
 # Describe what ingestion changed, including duplicates skipped by cosine similarity.

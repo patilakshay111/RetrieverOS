@@ -5,6 +5,7 @@ import hashlib
 import json
 
 from rag_pipeline.config import Settings
+from rag_pipeline.models import AccessContext
 from rag_pipeline.service import RAGService
 
 
@@ -27,7 +28,18 @@ def main() -> None:
             raise RuntimeError(f"Raw source digest mismatch for {document.source}.")
         strategy = arguments.strategy or document.chunking_strategy
         results.append(
-            service.knowledge_base.ingest(document.source, content, strategy)
+            service.knowledge_base.ingest(
+                document.source,
+                content,
+                strategy,
+                access_context=AccessContext(
+                    user_id=document.owner_id,
+                    workspace_id=document.workspace_id,
+                    roles=frozenset(document.required_roles),
+                    platform_admin=True,
+                ),
+                required_roles=document.required_roles,
+            )
         )
     print(json.dumps([item.model_dump(mode="json") for item in results], indent=2))
 

@@ -1,5 +1,6 @@
 # retrieval.py: combines FAISS dense search, BM25 keyword search, RRF, and cross-encoder ranking
 
+from collections import OrderedDict
 from collections.abc import Sequence
 import re
 import threading
@@ -10,7 +11,7 @@ from rank_bm25 import BM25Okapi
 
 from rag_pipeline.config import Settings
 from rag_pipeline.embeddings import EmbeddingProvider
-from rag_pipeline.models import RetrievedChunk
+from rag_pipeline.models import AccessContext, RetrievedChunk
 from rag_pipeline.storage import IndexSnapshot, KnowledgeBase
 
 
@@ -88,21 +89,61 @@ class HybridRetriever:
         self.settings = settings
         self.reranker = reranker
         self._bm25_generation: str | None = None
-        self._bm25: BM25Okapi | None = None
+        self._bm25_cache: OrderedDict[
+            tuple[str, str, tuple[str, ...], bool],
+            tuple[BM25Okapi | None, list[int]],
+        ] = OrderedDict()
         self._bm25_lock = threading.Lock()
 
-    # Return the cached or freshly built BM25 model for the selected snapshot.
-    def _bm25_for(self, snapshot: IndexSnapshot) -> BM25Okapi | None:
+    # Build sparse ranking only from chunks visible to the requesting access scope.
+    def _bm25_for(
+        self, snapshot: IndexSnapshot, access_context: AccessContext | None
+    ) -> tuple[BM25Okapi | None, list[int]]:
         if not snapshot.chunks:
-            return None
+            return None, []
+        if access_context is None:
+            scope = ("*", "*", (), True)
+        else:
+            scope = (
+                access_context.workspace_id,
+                access_context.user_id,
+                tuple(sorted(access_context.roles)),
+                access_context.platform_admin,
+            )
         with self._bm25_lock:
             if self._bm25_generation != snapshot.generation:
-                self._bm25 = BM25Okapi([tokenize(chunk.text) for chunk in snapshot.chunks])
+                self._bm25_cache.clear()
                 self._bm25_generation = snapshot.generation
-            return self._bm25
+            cached = self._bm25_cache.get(scope)
+            if cached is not None:
+                self._bm25_cache.move_to_end(scope)
+                return cached
+            positions = [
+                index
+                for index, chunk in enumerate(snapshot.chunks)
+                if access_context is None
+                or access_context.permits(
+                    chunk.workspace_id, chunk.owner_id, chunk.required_roles
+                )
+            ]
+            model = (
+                BM25Okapi([tokenize(snapshot.chunks[index].text) for index in positions])
+                if positions
+                else None
+            )
+            result = (model, positions)
+            self._bm25_cache[scope] = result
+            if len(self._bm25_cache) > 128:
+                self._bm25_cache.popitem(last=False)
+            return result
 
     # Retrieve, fuse, optionally rerank, and calibrate evidence for one user question.
-    def search(self, query: str, mode: str = "hybrid") -> tuple[list[RetrievedChunk], float]:
+    def search(
+        self,
+        query: str,
+        mode: str = "hybrid",
+        access_context: AccessContext | None = None,
+    ) -> tuple[list[RetrievedChunk], float]:
         if mode not in {"hybrid", "dense", "sparse"}:
             raise ValueError(f"Unknown retrieval mode: {mode}")
         snapshot = self.knowledge_base.snapshot()
@@ -112,25 +153,36 @@ class HybridRetriever:
         if snapshot.vectors.shape[1] != query_vector.shape[1]:
             raise RuntimeError("Query and index embedding dimensions do not match.")
         faiss.normalize_L2(query_vector)
-        dense_count = min(self.settings.dense_top_k, len(snapshot.chunks))
+        dense_count = min(self.settings.dense_top_k * 4, len(snapshot.chunks))
         dense_scores, dense_positions = snapshot.dense_index.search(query_vector, dense_count)
         dense_ranked = [
             (snapshot.chunks[int(position)].chunk_id, float(score))
             for score, position in zip(dense_scores[0], dense_positions[0], strict=True)
             if position >= 0
+            and (
+                access_context is None
+                or access_context.permits(
+                    snapshot.chunks[int(position)].workspace_id,
+                    snapshot.chunks[int(position)].owner_id,
+                    snapshot.chunks[int(position)].required_roles,
+                )
+            )
         ]
         query_tokens = set(tokenize(query))
-        sparse_model = self._bm25_for(snapshot) if mode != "dense" else None
+        sparse_model, sparse_positions_map = (
+            self._bm25_for(snapshot, access_context) if mode != "dense" else (None, [])
+        )
         sparse_values = (
             sparse_model.get_scores(list(query_tokens))
             if sparse_model and query_tokens
-            else np.zeros(len(snapshot.chunks), dtype=np.float32)
+            else np.zeros(len(sparse_positions_map), dtype=np.float32)
         )
         sparse_positions = np.argsort(sparse_values)[::-1]
         sparse_ranked: list[tuple[str, float]] = []
-        for position in sparse_positions:
+        for scoped_position in sparse_positions:
+            position = sparse_positions_map[int(scoped_position)]
             chunk = snapshot.chunks[int(position)]
-            score = float(sparse_values[position])
+            score = float(sparse_values[scoped_position])
             has_exact_term = bool(query_tokens.intersection(tokenize(chunk.text)))
             if score > 0 or has_exact_term:
                 sparse_ranked.append((chunk.chunk_id, score))
@@ -150,7 +202,14 @@ class HybridRetriever:
                 self.settings.sparse_weight,
                 self.settings.rrf_k,
             )
-        chunks_by_id = {chunk.chunk_id: chunk for chunk in snapshot.chunks}
+        chunks_by_id = {
+            chunk.chunk_id: chunk
+            for chunk in snapshot.chunks
+            if access_context is None
+            or access_context.permits(
+                chunk.workspace_id, chunk.owner_id, chunk.required_roles
+            )
+        }
         ranked_ids = sorted(fusion_scores, key=fusion_scores.__getitem__, reverse=True)
         candidates = [
             RetrievedChunk(

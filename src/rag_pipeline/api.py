@@ -3,21 +3,28 @@
 import secrets
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+import jwt
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.exc import SQLAlchemyError
 from pydantic import BaseModel, Field, field_validator
 from starlette.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from rag_pipeline.config import Settings
-from rag_pipeline.models import AnswerResponse, DocumentInfo, IngestionResult
+from rag_pipeline.auth import OIDCVerifier, build_oidc_verifier
+from rag_pipeline.credentials import UserCredentialStore
+from rag_pipeline.embeddings import OpenAIEmbeddingProvider
+from rag_pipeline.models import AccessContext, AnswerResponse, DocumentInfo, IngestionResult
 from rag_pipeline.service import RAGService
 
 
 # Expose one optional API-key header so development can stay frictionless.
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 # Signal that a request exceeded the bounded ASGI body size.
@@ -127,7 +134,19 @@ class AskRequest(BaseModel):
         return value
 
 
-# Build the API and enforce configured API keys outside the health endpoint.
+class OpenAIKeyRequest(BaseModel):
+    api_key: str = Field(min_length=20, max_length=512)
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, value: str) -> str:
+        key = value.strip()
+        if not key:
+            raise ValueError("The OpenAI API key cannot be blank.")
+        return key
+
+
+# Build the API and enforce OIDC or local API-key authentication outside health.
 def create_app(settings: Settings | None = None, service: RAGService | None = None) -> FastAPI:
     configured = settings or Settings.from_env()
     configured.validate_production()
@@ -141,22 +160,52 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
         allow_origins=list(configured.cors_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-API-Key"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     )
     app.add_middleware(
         RequestBodyLimitMiddleware,
         max_upload_bytes=configured.max_upload_bytes,
     )
     runtime = service
+    oidc_verifier = build_oidc_verifier(configured)
+    if bool(configured.database_url) != bool(configured.user_key_encryption_key):
+        raise ValueError(
+            "DATABASE_URL and USER_KEY_ENCRYPTION_KEY must be configured together."
+        )
+    credential_store = (
+        UserCredentialStore(
+            configured.database_url, configured.user_key_encryption_key
+        )
+        if configured.database_url and configured.user_key_encryption_key
+        else None
+    )
 
-    # Require a constant-time API key match when an API key is configured.
-    def authorize(api_key: Annotated[str | None, Depends(api_key_header)]) -> None:
-        if configured.app_env == "production" and not configured.api_key:
-            raise HTTPException(status_code=503, detail="API authentication is not configured.")
+    # Authenticate a signed Keycloak identity, retaining API-key mode only for local use.
+    def authorize(
+        api_key: Annotated[str | None, Depends(api_key_header)],
+        credentials: Annotated[
+            HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+        ],
+    ) -> AccessContext:
+        if oidc_verifier is not None:
+            if credentials is None or credentials.scheme.casefold() != "bearer":
+                raise HTTPException(status_code=401, detail="A valid bearer token is required.")
+            try:
+                return oidc_verifier.verify(credentials.credentials)
+            except (jwt.PyJWTError, OSError, ValueError) as error:
+                raise HTTPException(status_code=401, detail="The bearer token is invalid.") from error
+        if configured.app_env == "production":
+            raise HTTPException(status_code=503, detail="OIDC authentication is not configured.")
         if configured.api_key and (
             api_key is None or not secrets.compare_digest(api_key, configured.api_key)
         ):
             raise HTTPException(status_code=401, detail="A valid X-API-Key header is required.")
+        return AccessContext(
+            user_id="local",
+            workspace_id="local",
+            roles=frozenset({"admin"}),
+            platform_admin=True,
+        )
 
     # Resolve the shared service lazily and return setup errors as explicit service failures.
     def get_runtime() -> RAGService:
@@ -168,42 +217,178 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
                 raise HTTPException(status_code=503, detail=str(error)) from error
         return runtime
 
+    # Resolve a user's private OpenAI key without exposing it through the API.
+    def get_user_openai_key(access_context: AccessContext) -> str:
+        if oidc_verifier is not None:
+            if credential_store is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Per-user OpenAI key storage is not configured.",
+                )
+            try:
+                api_key = credential_store.get_key(
+                    access_context.user_id, access_context.workspace_id
+                )
+            except SQLAlchemyError as error:
+                raise HTTPException(
+                    status_code=503, detail="Unable to access credential storage."
+                ) from error
+            if api_key is None:
+                raise HTTPException(
+                    status_code=428,
+                    detail="Add your OpenAI API key in account settings before using the RAG API.",
+                )
+            return api_key
+        if configured.openai_api_key:
+            return configured.openai_api_key
+        if credential_store is None:
+            raise HTTPException(
+                status_code=428,
+                detail="Configure an OpenAI API key before using the RAG API.",
+            )
+        try:
+            api_key = credential_store.get_key(
+                access_context.user_id, access_context.workspace_id
+            )
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="Unable to access credential storage."
+            ) from error
+        if api_key is None:
+            raise HTTPException(
+                status_code=428,
+                detail="Configure an OpenAI API key before using the RAG API.",
+            )
+        return api_key
+
+    # Store only an authenticated user's own encrypted model credential.
+    @app.get("/v1/account/openai-key")
+    def openai_key_status(
+        access_context: Annotated[AccessContext, Depends(authorize)],
+    ) -> dict[str, bool]:
+        if credential_store is None:
+            raise HTTPException(
+                status_code=503, detail="Per-user OpenAI key storage is not configured."
+            )
+        try:
+            return {
+                "configured": credential_store.has_key(
+                    access_context.user_id, access_context.workspace_id
+                )
+            }
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="Unable to access credential storage."
+            ) from error
+
+    @app.put("/v1/account/openai-key", status_code=204)
+    def save_openai_key(
+        request: OpenAIKeyRequest,
+        access_context: Annotated[AccessContext, Depends(authorize)],
+    ) -> None:
+        if credential_store is None:
+            raise HTTPException(
+                status_code=503, detail="Per-user OpenAI key storage is not configured."
+            )
+        try:
+            credential_store.set_key(
+                access_context.user_id,
+                access_context.workspace_id,
+                request.api_key,
+            )
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="Unable to save the encrypted credential."
+            ) from error
+
+    @app.delete("/v1/account/openai-key", status_code=204)
+    def delete_openai_key(
+        access_context: Annotated[AccessContext, Depends(authorize)],
+    ) -> None:
+        if credential_store is None:
+            raise HTTPException(
+                status_code=503, detail="Per-user OpenAI key storage is not configured."
+            )
+        try:
+            credential_store.delete_key(
+                access_context.user_id, access_context.workspace_id
+            )
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="Unable to delete the encrypted credential."
+            ) from error
+
     # Report process readiness without exposing private configuration.
     @app.get("/healthz", tags=["operations"])
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/readyz", tags=["operations"])
+    def readiness() -> dict[str, str]:
+        if configured.app_env == "production" and credential_store is None:
+            raise HTTPException(
+                status_code=503, detail="Credential storage is not configured."
+            )
+        if credential_store is not None:
+            try:
+                credential_store.check()
+            except SQLAlchemyError as error:
+                raise HTTPException(
+                    status_code=503, detail="Credential storage is unavailable."
+                ) from error
+        return {"status": "ready"}
+
     # Return the current indexed-document inventory.
-    @app.get("/v1/documents", response_model=list[DocumentInfo], dependencies=[Depends(authorize)])
-    def documents() -> list[DocumentInfo]:
+    @app.get("/v1/documents", response_model=list[DocumentInfo])
+    def documents(
+        access_context: Annotated[AccessContext, Depends(authorize)],
+    ) -> list[DocumentInfo]:
         try:
-            return get_runtime().knowledge_base.list_documents()
+            return get_runtime().knowledge_base.list_documents(access_context)
         except HTTPException:
             raise
         except (OSError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
     # Ingest one bounded Markdown, text, HTML, or PDF upload.
-    @app.post(
-        "/v1/ingest",
-        response_model=IngestionResult,
-        dependencies=[Depends(authorize)],
-    )
+    @app.post("/v1/ingest", response_model=IngestionResult)
     async def ingest(
         file: Annotated[UploadFile, File()],
+        access_context: Annotated[AccessContext, Depends(authorize)],
         strategy: Annotated[Literal["fixed", "recursive", "semantic"], Form()] = "recursive",
+        roles: Annotated[str, Form()] = "employee",
     ) -> IngestionResult:
+        assigned_roles = sorted({role.strip() for role in roles.split(",") if role.strip()})
+        if not assigned_roles:
+            raise HTTPException(status_code=422, detail="At least one document role is required.")
+        if not access_context.platform_admin and not set(assigned_roles).issubset(
+            access_context.roles
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="You may assign only roles granted to your account.",
+            )
         if not file.filename:
             raise HTTPException(status_code=400, detail="An upload filename is required.")
         content = await file.read(configured.max_upload_bytes + 1)
         if len(content) > configured.max_upload_bytes:
             raise HTTPException(status_code=413, detail="The uploaded document exceeds the size limit.")
         try:
+            user_api_key = get_user_openai_key(access_context)
+            embeddings = OpenAIEmbeddingProvider(configured, user_api_key)
             return await run_in_threadpool(
-                get_runtime().knowledge_base.ingest, file.filename, content, strategy
+                get_runtime().knowledge_base.ingest,
+                file.filename,
+                content,
+                strategy,
+                access_context,
+                assigned_roles,
+                embeddings,
             )
         except HTTPException:
             raise
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
         except (OSError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -211,15 +396,20 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     @app.post(
         "/v1/ask",
         response_model=AnswerResponse,
-        dependencies=[Depends(authorize)],
     )
-    async def ask(request: AskRequest) -> AnswerResponse:
+    async def ask(
+        request: AskRequest,
+        access_context: Annotated[AccessContext, Depends(authorize)],
+    ) -> AnswerResponse:
         try:
+            user_api_key = get_user_openai_key(access_context)
             return await run_in_threadpool(
                 get_runtime().ask,
                 request.question,
                 request.retrieval_mode,
                 request.thread_id,
+                access_context,
+                user_api_key,
             )
         except HTTPException:
             raise
@@ -230,15 +420,30 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
     @app.post(
         "/v1/compare",
         response_model=dict[str, AnswerResponse],
-        dependencies=[Depends(authorize)],
     )
-    async def compare(request: AskRequest) -> dict[str, AnswerResponse]:
+    async def compare(
+        request: AskRequest,
+        access_context: Annotated[AccessContext, Depends(authorize)],
+    ) -> dict[str, AnswerResponse]:
         runtime_service = get_runtime()
         try:
+            user_api_key = get_user_openai_key(access_context)
             hybrid, dense = await run_in_threadpool(
                 lambda: (
-                    runtime_service.ask(request.question, "hybrid", f"{request.thread_id}-hybrid"),
-                    runtime_service.ask(request.question, "dense", f"{request.thread_id}-dense"),
+                    runtime_service.ask(
+                        request.question,
+                        "hybrid",
+                        f"{request.thread_id}-hybrid",
+                        access_context,
+                        user_api_key,
+                    ),
+                    runtime_service.ask(
+                        request.question,
+                        "dense",
+                        f"{request.thread_id}-dense",
+                        access_context,
+                        user_api_key,
+                    ),
                 )
             )
             return {"hybrid": hybrid, "dense": dense}
