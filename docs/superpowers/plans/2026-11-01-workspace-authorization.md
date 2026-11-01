@@ -48,11 +48,11 @@ server-derived workspace scope and membership API.
 - Personal-workspace provisioning is idempotent and runs when a verified new
   subject first reaches an authenticated API route.
 
-- [ ] **Step 1: Write failing persistence tests** for multiple memberships, unique `(user_id, workspace_id)`, workspace creation, role assignment, and membership status.
-- [ ] **Step 2: Run** `python -m pytest tests/test_core.py -k workspace_membership`; confirm the new cases fail.
-- [ ] **Step 3: Implement** typed SQLAlchemy models/repository and an Alembic revision; keep credential storage behavior unchanged.
-- [ ] **Step 4: Run** focused tests and `alembic upgrade head` against a temporary SQLite database; confirm the tables and uniqueness constraints.
-- [ ] **Step 5: Commit** the migration, repository, and tests together.
+- [x] **Step 1: Write failing persistence tests** for multiple memberships, unique `(user_id, workspace_id)`, workspace creation, role assignment, and membership status.
+- [x] **Step 2: Run** `python -m pytest tests/test_core.py -k workspace_membership`; confirm the new cases fail.
+- [x] **Step 3: Implement** typed SQLAlchemy models/repository and an Alembic revision; keep credential storage behavior unchanged.
+- [x] **Step 4: Run** focused tests and `alembic upgrade head` against a temporary SQLite database; confirm the tables and uniqueness constraints.
+- [x] **Step 5: Commit** the migration, repository, and tests together.
 
 ### Task 2: Resolve active workspace from persisted membership
 
@@ -66,11 +66,11 @@ server-derived workspace scope and membership API.
 - Consumes: signed `AccessContext`, optional `X-Workspace-ID`, and Task 1 membership repository.
 - Produces: `WorkspaceAccessContext(user_id, workspace_id, roles, platform_admin)` returned from an API dependency; no endpoint accepts client-supplied roles as authorization.
 
-- [ ] **Step 1: Write failing API tests** for personal-workspace default, valid member workspace selection, unknown workspace, non-member workspace, and role changes taking effect without token refresh.
-- [ ] **Step 2: Run** `python -m pytest tests/test_core.py -k workspace_scope`; confirm denied scopes currently fail the expected assertions.
-- [ ] **Step 3: Implement** server-side workspace resolution. Use the user's personal-workspace default when no header is supplied; when a header is supplied, require a current membership unless the caller is a platform admin. Platform-admin access to a workspace other than the user's own must be audited. Resolve roles from PostgreSQL, not the workspace claim or client input.
-- [ ] **Step 4: Run** focused tests plus existing OIDC/ACL tests; confirm legacy local-development auth remains functional.
-- [ ] **Step 5: Commit** scope resolution and regression tests.
+- [x] **Step 1: Write failing API tests** for personal-workspace default, valid member workspace selection, unknown workspace, non-member workspace, and role changes taking effect without token refresh.
+- [x] **Step 2: Run** `python -m pytest tests/test_core.py -k workspace_scope`; confirm denied scopes currently fail the expected assertions.
+- [x] **Step 3: Implement** server-side workspace resolution. Use the user's personal-workspace default when no header is supplied; when a header is supplied, require a current membership unless the caller is a platform admin. Platform-admin access to a workspace other than the user's own must be audited. Resolve roles from PostgreSQL, not the workspace claim or client input.
+- [x] **Step 4: Run** focused tests plus existing OIDC/ACL tests; confirm legacy local-development auth remains functional.
+- [x] **Step 5: Commit** scope resolution and regression tests.
 
 ### Task 3: Add workspace membership and invitation endpoints
 
@@ -96,7 +96,7 @@ server-derived workspace scope and membership API.
 - [x] **Step 2: Run** focused workspace/OIDC tests; confirm endpoint authorization tests fail before route registration.
 - [x] **Step 3: Implement** typed request/response models, routes, and an SMTP email adapter. Workspace admins may administer only their own workspace; only platform admins may define global role names. Store only a hash of each invitation token.
 - [x] **Step 4: Run** focused tests and API OpenAPI generation; confirm no route trusts an unverified workspace ID.
-- [ ] **Step 5: Commit** route, service, and endpoint tests.
+- [x] **Step 5: Commit** route, service, and endpoint tests.
 
 ### Task 4: Audit privileged workspace access
 
@@ -114,7 +114,7 @@ server-derived workspace scope and membership API.
 - [x] **Step 2: Run** focused audit tests; confirm they fail before request IDs and audit event persistence are implemented.
 - [x] **Step 3: Implement** the audit repository and write events in every cross-workspace request path, including reads and RAG operations, not only admin mutations.
 - [x] **Step 4: Run** focused audit and authorization tests; verify persisted audit rows through a separate database connection.
-- [ ] **Step 5: Commit** audit migration, service, and tests.
+- [x] **Step 5: Commit** audit migration, service, and tests.
 
 ### Task 5: Verify the authorization API contract
 
@@ -127,4 +127,4 @@ server-derived workspace scope and membership API.
 - [x] **Step 2: Run** `python -m pytest`; confirm all authorization tests pass.
 - [x] **Step 3: Document** workspace selection header, registration, invitation acceptance, and admin boundaries.
 - [x] **Step 4: Run** `git diff --check` and the full test suite; confirm docs match implemented routes.
-- [ ] **Step 5: Commit** contract docs and tests.
+- [x] **Step 5: Commit** contract docs and tests.
