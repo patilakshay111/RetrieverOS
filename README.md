@@ -10,6 +10,71 @@ The workflow is implemented as a LangGraph `StateGraph` with Pydantic state and 
 
 Contributions and issue reports are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development and pull request workflow.
 
+## Production data flow
+
+These diagrams follow the implemented ingestion and question-answering paths. The index is local FAISS; document embeddings and answer/judge calls use the configured OpenAI models. BM25 is rebuilt from the exact active chunk snapshot on the first sparse or hybrid search for that generation, then cached in process.
+
+### Ingestion and index publication
+
+```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
+flowchart LR
+    upload["Document upload"] --> api["POST /v1/ingest"]
+    samples["Sample documents"] --> seed["seed.py"]
+    archive["Archived documents"] --> reindex["reindex.py<br/>verify source hash"]
+    api --> ingest["Parse and chunk<br/>selected strategy"]
+    seed --> ingest
+    reindex --> ingest
+    ingest --> embed["Embed chunks<br/>configured OpenAI model"]
+    embed --> dedupe["Deduplicate and replace<br/>this source's chunks"]
+    dedupe --> stage["Write complete staged<br/>index generation"]
+    stage --> publish["Atomically publish<br/>index/CURRENT"]
+    publish --> active["Active index snapshot"]
+
+    classDef input fill:#0d1b2a,stroke:#4cc9f0,color:#ffffff;
+    classDef process fill:#1b263b,stroke:#4cc9f0,color:#ffffff;
+    classDef storage fill:#0d1b2a,stroke:#ffd166,color:#ffffff;
+    classDef provider fill:#1b263b,stroke:#06d6a0,color:#ffffff;
+
+    class upload,samples,archive input;
+    class api,seed,reindex,ingest,dedupe process;
+    class stage,publish,active storage;
+    class embed provider;
+```
+
+### Question answering
+
+```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
+flowchart LR
+    client["Streamlit or API client"] --> ask["POST /v1/ask"]
+    ask --> workflow["RAGService / LangGraph<br/>load thread history"]
+    workflow --> query["Build query from question<br/>and recent history"]
+    query --> retrieve["Retrieve evidence<br/>FAISS, BM25, or hybrid RRF"]
+    retrieve --> rerank["Optional cross-encoder reranking"]
+    rerank --> gate{"Retrieval confidence<br/>below threshold?"}
+    gate -->|Yes| abstain["Return insufficient-context answer"]
+    gate -->|No| answer["Generate grounded answer<br/>OpenAI"]
+    answer --> citations["Verify cited claims<br/>LLM judge"]
+    citations --> completeness["Assess completeness<br/>LLM judge"]
+    abstain --> score["Calculate final confidence locally<br/>append turn to history"]
+    completeness --> score
+    score --> response["Return answer, evidence,<br/>citations, scores, thread_id"]
+    response --> client
+
+    classDef client fill:#0d1b2a,stroke:#4cc9f0,color:#ffffff;
+    classDef service fill:#1b263b,stroke:#4cc9f0,color:#ffffff;
+    classDef decision fill:#0d1b2a,stroke:#ffd166,color:#ffffff;
+    classDef provider fill:#1b263b,stroke:#06d6a0,color:#ffffff;
+
+    class client,response client;
+    class ask,workflow,query,retrieve,rerank,abstain,score service;
+    class gate decision;
+    class answer,citations,completeness provider;
+```
+
+For low retrieval confidence, the graph skips answer generation, citation verification, and completeness judging; it returns an insufficient-context response instead. Otherwise, the confidence score combines retrieval confidence, citation coverage, and the completeness assessment. `POST /v1/compare` runs this answering path twice, once in hybrid mode and once in dense-only mode, using separate `-hybrid` and `-dense` thread IDs.
+
 ## Run the application on Windows
 
 Use your installed global Python (3.11 or newer); this guide does not create a virtual environment. From the project root, check Python and install the project and its development tools into that Python installation:
@@ -129,73 +194,6 @@ See the [project recreation guide](./docs/PROJECT_RECREATION_GUIDE.md) and [case
 - `POST /v1/compare`: hybrid and dense-only responses for the same question.
 
 Set `API_KEY` to require `X-API-Key` authentication. Production startup requires both `API_KEY` (at least 32 characters) and `OPENAI_API_KEY`, and rejects wildcard CORS. Uploads are size-limited; raw uploads and immutable index generations are stored under `DATA_DIR`.
-
-## Production data flow
-
-These diagrams follow the implemented ingestion and question-answering paths. The index is local FAISS; document embeddings and answer/judge calls use the configured OpenAI models. BM25 is rebuilt from the exact active chunk snapshot on the first sparse or hybrid search for that generation, then cached in process.
-
-### Ingestion and index publication
-
-```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
-flowchart LR
-    upload["Document upload"] --> api["POST /v1/ingest"]
-    samples["Sample documents"] --> seed["seed.py"]
-    archive["Archived documents"] --> reindex["reindex.py<br/>verify source hash"]
-    api --> ingest["Parse and chunk<br/>selected strategy"]
-    seed --> ingest
-    reindex --> ingest
-    ingest --> embed["Embed chunks<br/>configured OpenAI model"]
-    embed --> dedupe["Deduplicate and replace<br/>this source's chunks"]
-    dedupe --> stage["Write complete staged<br/>index generation"]
-    stage --> publish["Atomically publish<br/>index/CURRENT"]
-    publish --> active["Active index snapshot"]
-
-    classDef input fill:#0d1b2a,stroke:#4cc9f0,color:#ffffff;
-    classDef process fill:#1b263b,stroke:#4cc9f0,color:#ffffff;
-    classDef storage fill:#0d1b2a,stroke:#ffd166,color:#ffffff;
-    classDef provider fill:#1b263b,stroke:#06d6a0,color:#ffffff;
-
-    class upload,samples,archive input;
-    class api,seed,reindex,ingest,dedupe process;
-    class stage,publish,active storage;
-    class embed provider;
-```
-
-`seed.py` feeds the bundled sample files into the same ingestion method. `reindex.py` reads only documents in the active manifest, verifies each archived source digest, and re-ingests it using its recorded strategy unless another is selected. An ingestion failure does not switch the `CURRENT` pointer to an incomplete generation.
-
-### Question answering
-
-```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
-flowchart LR
-    client["Streamlit or API client"] --> ask["POST /v1/ask"]
-    ask --> workflow["RAGService / LangGraph<br/>load thread history"]
-    workflow --> query["Build query from question<br/>and recent history"]
-    query --> retrieve["Retrieve evidence<br/>FAISS, BM25, or hybrid RRF"]
-    retrieve --> rerank["Optional cross-encoder reranking"]
-    rerank --> gate{"Retrieval confidence<br/>below threshold?"}
-    gate -->|Yes| abstain["Return insufficient-context answer"]
-    gate -->|No| answer["Generate grounded answer<br/>OpenAI"]
-    answer --> citations["Verify cited claims<br/>LLM judge"]
-    citations --> completeness["Assess completeness<br/>LLM judge"]
-    abstain --> score["Calculate final confidence locally<br/>append turn to history"]
-    completeness --> score
-    score --> response["Return answer, evidence,<br/>citations, scores, thread_id"]
-    response --> client
-
-    classDef client fill:#0d1b2a,stroke:#4cc9f0,color:#ffffff;
-    classDef service fill:#1b263b,stroke:#4cc9f0,color:#ffffff;
-    classDef decision fill:#0d1b2a,stroke:#ffd166,color:#ffffff;
-    classDef provider fill:#1b263b,stroke:#06d6a0,color:#ffffff;
-
-    class client,response client;
-    class ask,workflow,query,retrieve,rerank,abstain,score service;
-    class gate decision;
-    class answer,citations,completeness provider;
-```
-
-For low retrieval confidence, the graph skips answer generation, citation verification, and completeness judging; it returns an insufficient-context response instead. Otherwise, the confidence score combines retrieval confidence, citation coverage, and the completeness assessment. `POST /v1/compare` runs this answering path twice, once in hybrid mode and once in dense-only mode, using separate `-hybrid` and `-dense` thread IDs.
 
 ## Architecture notes
 
