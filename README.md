@@ -4,11 +4,13 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
 [![CI](https://github.com/patilakshay111/hybrid-rag-studio/actions/workflows/tests.yml/badge.svg)](https://github.com/patilakshay111/hybrid-rag-studio/actions/workflows/tests.yml)
 
-A production-minded, open-source Python 3.11+ RAG application for Markdown, text, HTML, and PDF documents. It supports local FAISS/BM25 retrieval and shared Qdrant/PostgreSQL dense and full-text retrieval, weighted Reciprocal Rank Fusion, an optional cross-encoder reranker (enabled by default), grounded OpenAI answers, per-claim citation checks, and confidence scoring.
+A production-minded, open-source hybrid RAG application with a Python 3.11+ FastAPI backend and a React/TypeScript web dashboard. It supports Markdown, text, HTML, and PDF documents; local FAISS/BM25 retrieval and shared Qdrant/PostgreSQL dense and full-text retrieval; weighted Reciprocal Rank Fusion; an optional cross-encoder reranker; grounded OpenAI answers; per-claim citation checks; and confidence scoring.
 
-The workflow is implemented as a LangGraph `StateGraph` with Pydantic state and an in-memory `MemorySaver` checkpoint per `thread_id`, retaining the latest 20 conversation turns. The FastAPI service exposes ingestion and question endpoints; the Streamlit dashboard supports side-by-side hybrid and dense-only answers.
+The RAG workflow is implemented as a LangGraph `StateGraph` with Pydantic state and bounded recent-turn history. PostgreSQL deployments use the LangGraph PostgreSQL checkpointer and server-generated, user/workspace-scoped conversation IDs; local development can use the in-memory `MemorySaver`. The React dashboard supports Keycloak sign-in, isolated workspaces, document ingestion, chat with citations, retrieval comparison, invitations and role management, private API keys, and platform operations.
 
 Contributions and issue reports are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development and pull request workflow.
+
+![Hybrid RAG Studio landing page](./docs/landing-page.png)
 
 ## Local multi-service stack
 
@@ -22,7 +24,7 @@ notepad .env
 docker compose up --build
 ```
 
-The dashboard is at <http://localhost:8501>, the API at
+The React dashboard is at <http://localhost:5173>, the API at
 <http://localhost:8000/docs>, Keycloak at <http://localhost:8080>, and the
 Mailpit inbox at <http://localhost:8025>. All host ports bind to loopback.
 Docker Desktop (or another Docker Engine) must be running.
@@ -30,46 +32,50 @@ Compose runs the Alembic database migration before starting the API.
 For an externally managed PostgreSQL database, run `alembic upgrade head`
 with that environment's `DATABASE_URL` before deploying the API.
 
-To turn on Keycloak login:
-
-1. Open the `hybrid-rag` realm in Keycloak. Create a confidential OIDC client
-   named `hybrid-rag-dashboard` with standard flow enabled and redirect URI
-   `http://localhost:8501/oauth2callback`. Copy its generated client secret
-   into a local `.streamlit/secrets.toml`, using
-   `.streamlit/secrets.toml.example` as the template. Generate a unique
-   `cookie_secret`; do not use the example value.
-2. Add an audience mapper to the client so its access tokens include
-   `hybrid-rag-api` in `aud`.
-3. Set `OIDC_ISSUER_URL=http://localhost:8080/realms/hybrid-rag`,
-   `OIDC_JWKS_URL=http://keycloak:8080/realms/hybrid-rag/protocol/openid-connect/certs`,
-   and `STREAMLIT_OIDC_ENABLED=true` in `.env`, then restart the stack.
-4. Open registration requires email verification. Local verification and
-   password-reset messages appear in Mailpit. To enable Google login, configure
-   a Google identity provider in the Keycloak realm with OAuth credentials
-   created in your own Google Cloud project; never put those credentials in
-   source control or this chat.
+On a new Compose volume, Keycloak imports the `hybrid-rag` realm with the
+public `hybrid-rag-web` client, PKCE S256, and the API audience mapper.
+Registration requires email verification; local verification and password
+reset messages appear in Mailpit. To enable Google login, configure a Google
+identity provider in Keycloak using OAuth credentials from your own Google
+Cloud project; never put those credentials in source control or this chat.
+Keycloak does not re-import a realm over an existing persistent realm. If the
+volume already contains `hybrid-rag`, update that realm's web client and
+audience mapper in the Keycloak Admin Console rather than deleting identity
+data.
 
 The API verifies Keycloak access-token signatures, issuer, audience, and
-expiry. It provisions each authenticated subject's personal workspace and
-resolves workspace membership and application roles from PostgreSQL on every
-request; workspace IDs and roles in token or browser claims are not trusted.
-Select a shared workspace with the `X-Workspace-ID` request header. The
-`platform-admin` Keycloak realm role grants platform-level administration;
-the `admin`, `ceo`, `employee`, and `hr` roles are global role definitions
-assigned to users through workspace memberships.
+expiry. It resolves workspace membership and application permissions from
+PostgreSQL on every request; workspace IDs, role names, and permission claims
+from the browser or identity token are not trusted. A new account does not get
+an implicit workspace: first sign-in prompts the user to create one with a
+name and description. Its creator becomes the initial workspace admin. An
+invited user can accept an invitation before creating any workspace and is
+then taken directly to the invited workspace; users can create additional
+workspaces later. Select an active workspace in the dashboard or use the
+`X-Workspace-ID` header for workspace-scoped API calls.
 
-Authenticated users can list their workspaces and read the global role
-catalog. Workspace admins can administer memberships and invite users only
-within their workspace. Only platform admins can create global role
-definitions or administer across workspaces. Invitation acceptance requires
-the invitee's verified OIDC email to match the invitation; invitation tokens
-are stored hashed, expire after the configured period (72 hours by default),
-and can be accepted once. Configure `SMTP_*` in `.env`; Compose sends mail to
-Mailpit. Privileged cross-workspace API access is recorded in PostgreSQL with
-an action, target, actor, timestamp, and request ID, without recording prompts,
-documents, answers, or tokens. The API applies workspace, owner, and role ACL
-checks before returning documents or passing retrieved evidence to the answer
-graph. Conversation checkpoints are namespaced by user and workspace.
+The built-in `admin`, `ceo`, `employee`, and `hr` roles are defined separately
+inside each workspace. Workspace admins can create additional roles and choose
+among `documents:read`, `documents:query`, `documents:upload`, and
+`documents:update`; they can also edit workspace details, manage members, and
+invite users with one or more workspace roles. A member's capabilities are the
+union of their assigned roles. Document ACLs can include multiple roles, and
+the API validates every ACL role against the active workspace before
+embedding or storing content. For non-admin members, visibility and retrieval
+also require an ACL role match and the corresponding capability.
+
+The `platform-admin` Keycloak realm role is separate from workspace roles; it
+grants audited platform-level access and does not replace workspace-local role
+definitions. Invitation acceptance requires the invitee's verified OIDC email
+to match the invitation; invitation tokens are stored hashed, expire after the
+configured period (72 hours by default), and can be accepted once. Configure
+`SMTP_*` in `.env`; Compose sends verification and invitation mail to Mailpit.
+Privileged cross-workspace API access is recorded in PostgreSQL with an
+action, target, actor, timestamp, and request ID, without recording prompts,
+documents, answers, or tokens. The API applies workspace, owner, capability,
+and document-ACL checks before returning documents or passing retrieved
+evidence to the answer graph. Conversation checkpoints are namespaced by user
+and workspace.
 
 With OIDC enabled, each user can save, rotate, or delete their own OpenAI key
 from the dashboard. The API encrypts keys in Postgres using
@@ -79,19 +85,24 @@ plaintext is not returned by the API. In local development without OIDC, the
 legacy shared `OPENAI_API_KEY` remains available.
 
 **This is an in-progress production-hardening effort, not a production-ready
-deployment.** Workspace authorization, invitation APIs, and cross-workspace
-audit logging are implemented and covered by offline tests. When both
+deployment.** The React dashboard, workspace authorization, invitation APIs,
+and cross-workspace audit logging are implemented. They have not yet been
+validated end to end with the local Compose stack. The local images built,
+all services became healthy, and `/readyz` reported Postgres, Qdrant, and Redis
+ready. Browser sign-in is currently blocked because the existing persistent
+Keycloak realm does not contain `hybrid-rag-web`; the realm was left unchanged.
+Add that client and its audience mapper before validating sign-in, invitations,
+two-user workspace isolation, or ingestion/chat. When both
 `QDRANT_URL` and `DATABASE_URL` are configured, ingestion writes vectors to
 Qdrant and current chunks to the PostgreSQL catalog, and retrieval uses those
 shared stores. Native development without both settings continues to use local
-FAISS and BM25. Conversation checkpoints remain in memory; Redis caching,
-OpenTelemetry, and deployment automation still need implementation and
-validation. Kubernetes is out of scope. GitHub Actions currently runs the
-offline tests, then validates Compose and builds the container image; it does
-not publish or deploy an image. The Compose stack has not been started in this
-environment because the Docker Engine is unavailable. Render will be tested
-after local implementation and validation. Do not expose this stack to the
-public internet or ingest confidential documents yet.
+FAISS and BM25. Redis rate limits/cache and PostgreSQL conversation
+checkpoints are implemented but still need local integration verification.
+OpenTelemetry and deployment automation remain future work; Kubernetes is out
+of scope. GitHub Actions runs backend and frontend checks, validates Compose,
+and builds the container image; it does not publish or deploy an image. Render
+validation follows successful local integration testing. Do not expose this
+stack to the public internet or ingest confidential documents yet.
 
 ## Production data flow
 
@@ -144,8 +155,16 @@ flowchart LR
 ```mermaid
 %%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#0d1b2a', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#4cc9f0', 'lineColor': '#4cc9f0', 'secondaryColor': '#1b263b', 'tertiaryColor': '#4cc9f0' }}}%%
 flowchart LR
-    client["Streamlit or API client"] --> ask["POST /v1/ask"]
-    ask --> workflow["RAGService / LangGraph<br/>load thread history"]
+    client["React SPA or API client"] --> ask["POST /v1/ask"]
+    ask --> limit["Redis rate limit<br/>ask, ingest, compare"]
+    limit -->|Allowed| resolve["Resolve conversation<br/>derive scoped thread ID"]
+    limit -->|Denied or unavailable in production| limited["429 or 503"]
+    resolve --> eligible{"Stateless call<br/>and no checkpointer?"}
+    eligible -->|Yes| lookup["Redis answer-cache lookup"]
+    lookup -->|Hit| response["Return answer, evidence,<br/>citations, scores, conversation_id"]
+    lookup -->|Miss or cache error| workflow["RAGService / LangGraph"]
+    eligible -->|No| workflow
+    workflow <--> checkpoints["PostgreSQL checkpointer<br/>or local MemorySaver"]
     workflow --> query["Build query from question<br/>and recent history"]
     query --> embed["Embed query<br/>configured OpenAI model"]
     embed --> scope{"Shared stores configured?"}
@@ -164,7 +183,9 @@ flowchart LR
     citations --> completeness["Assess completeness<br/>LLM judge"]
     abstain --> score["Calculate final confidence locally<br/>append turn to history"]
     completeness --> score
-    score --> response["Return answer, evidence,<br/>citations, scores, thread_id"]
+    score -->|Stateless cache eligible| cache_write["Store bounded response<br/>with hashed scoped key and TTL"]
+    cache_write --> response
+    score -->|Otherwise| response
     response --> client
 
     classDef client fill:#0d1b2a,stroke:#4cc9f0,color:#ffffff;
@@ -173,12 +194,13 @@ flowchart LR
     classDef provider fill:#1b263b,stroke:#06d6a0,color:#ffffff;
 
     class client,response client;
-    class ask,workflow,query,retrieve,embed,dense,catalog,lexical,local,fusion,rerank,abstain,score service;
-    class gate decision;
+    class ask,limit,limited,workflow,query,retrieve,embed,dense,catalog,lexical,local,fusion,rerank,abstain,score service;
+    class gate,eligible decision;
+    class lookup,cache_write storage;
     class answer,citations,completeness provider;
 ```
 
-For low retrieval confidence, the graph skips answer generation, citation verification, and completeness judging; it returns an insufficient-context response instead. Otherwise, the confidence score combines retrieval confidence, citation coverage, and the completeness assessment. `POST /v1/compare` runs this answering path twice, once in hybrid mode and once in dense-only mode, using separate `-hybrid` and `-dense` thread IDs.
+For low retrieval confidence, the graph skips answer generation, citation verification, and completeness judging; it returns an insufficient-context response instead. Otherwise, the confidence score combines retrieval confidence, citation coverage, and the completeness assessment. `POST /v1/compare` runs this answering path twice, once in hybrid mode and once in dense-only mode, using separate server-derived checkpoint variants for the same authorized conversation.
 
 ## Run the application on Windows
 
@@ -205,7 +227,16 @@ $env:DATABASE_URL = "sqlite:///./data/runtime/credentials.db"
 ```
 
 Docker Compose overrides `DATABASE_URL` with its Postgres service address and
-runs migrations automatically.
+runs migrations automatically. Compose also connects the API to its Redis
+service for request limits and optional stateless answer caching. For native
+development, leave `REDIS_URL` blank unless a Redis server is running; a VS
+Code Redis extension is only a client and does not start the Redis server.
+
+Production requires `REDIS_URL`. Redis-backed rate limits are enforced for
+ingest, ask, and compare requests, and Redis outages fail those requests closed.
+Answer cache entries use hashed question/scope keys, bounded values, and a
+short TTL. Caching is intentionally skipped when conversation checkpoints are
+active so a cache hit cannot bypass conversation-history updates.
 
 ### 1. Index the bundled sample documents
 
@@ -221,25 +252,26 @@ refreshes the same sample documents. To select a chunking strategy, use
 
 ### 2. Start the API and dashboard
 
-Open two PowerShell terminals in the project root. Keep both running:
+The full multi-user application, including Keycloak and its backing services,
+runs through Compose:
 
-**Terminal 1 — API**
-```text
-python -m uvicorn rag_pipeline.api:app --reload
+```powershell
+docker compose up --build
 ```
 
-**Terminal 2 — Streamlit dashboard**
-```text
-python -m streamlit run src/rag_pipeline/ui.py
-```
-
-Open the dashboard at <http://localhost:8501>. The API health check is <http://localhost:8000/healthz>, and interactive API documentation is at <http://localhost:8000/docs>.
+Open the dashboard at <http://localhost:5173>. The API health check is
+<http://localhost:8000/healthz>, interactive API documentation is at
+<http://localhost:8000/docs>, and Mailpit is at <http://localhost:8025>.
+For frontend hot reload, run `npm --prefix web ci` and then
+`npm --prefix web run dev` in place of the Compose dashboard service; Vite
+proxies API requests to the local API.
 
 ### 3. Use the application
 
-- Ask questions in the dashboard. Answers include retrieved evidence, citations, confidence breakdowns, and citation-verification results.
-- Turn on **Compare hybrid retrieval with dense-only retrieval** to see those two answers side by side.
-- To ingest another Markdown, text, HTML, or PDF file, open <http://localhost:8000/docs>, expand `POST /v1/ingest`, select the file and chunking strategy, then execute the request. The API also supports `/v1/documents`, `/v1/ask`, and `/v1/compare`.
+- Register and verify an account using the link in Mailpit, then sign in through Keycloak. If the account has no membership, create a named workspace; an invited user should accept the invitation using the invited email and will land in that workspace. Save a private OpenAI key in Account settings before asking or ingesting unless the API has a shared `OPENAI_API_KEY`.
+- In Workspace, admins can edit the workspace name and description, create roles with explicit permissions, assign one or more roles to an invitation, and manage member roles. Keycloak realm roles do not define these workspace permissions.
+- Ask questions in the dashboard. Answers include retrieved evidence, citations, confidence breakdowns, and citation-verification results. Compare hybrid and dense-only retrieval from the chat workflow.
+- Upload supported Markdown, text, HTML, or PDF files from Documents and choose a chunking strategy and one or more workspace access roles. `documents:read`, `documents:upload`, and `documents:update` govern inventory, new uploads, and replacements respectively; `documents:query` governs chat and conversation history. The API also supports `/v1/documents`, `/v1/ask`, and `/v1/compare`.
 - The default reranker downloads its cross-encoder model the first time it is used; that first query may need network access. Set `RERANKER_ENABLED=false` in `.env` to disable it for a lightweight local run, then restart the API.
 - To rebuild embeddings from the documents already indexed, run `python -m rag_pipeline.reindex`. This also requires the API key for OpenAI embeddings.
 
@@ -251,6 +283,11 @@ These tests use deterministic local fakes and do not call OpenAI:
 
 ```powershell
 python -m pytest
+npm --prefix web ci
+npm --prefix web test
+npm --prefix web run lint
+npm --prefix web run build
+npm --prefix web audit --audit-level=high
 ```
 
 ### Compare retrieval modes
@@ -300,7 +337,8 @@ Open the Studio URL printed by the CLI to inspect `internal_docs_rag`; the serve
 ## Repository layout
 
 ```text
-src/rag_pipeline/   Application package, API, graph, UI, and CLI entrypoints
+src/rag_pipeline/   Application package, API, graph, and CLI entrypoints
+web/                React/TypeScript/Vite multi-user dashboard
 tests/              Offline unit and integration tests
 data/sample_docs/   Synthetic sample corpus used by the demo
 data/evaluation/    Golden evaluation dataset and generated results
@@ -316,27 +354,39 @@ See the [project recreation guide](./docs/PROJECT_RECREATION_GUIDE.md) and [case
 
 - `GET /healthz`: process liveness.
 - `GET /readyz`: readiness, including configured credential-store availability.
+- `GET /v1/admin/operations/reindex-dry-run`: platform-admin-only verification
+  of archived source digests and safe reindex metadata; it never changes the index.
 - `GET /v1/documents`: indexed document inventory.
 - `POST /v1/ingest`: multipart document upload and chunking strategy.
 - `POST /v1/ask`: grounded answer with citations, retrieved chunks, and confidence.
 - `POST /v1/compare`: hybrid and dense-only responses for the same question.
+- `GET`, `POST /v1/conversations`: list conversations in the active workspace or create one.
+- `GET`, `DELETE /v1/conversations/{conversation_id}`: read or delete only an owned conversation and its checkpoints.
 - `GET`, `PUT`, `DELETE /v1/account/openai-key`: inspect whether the caller's
   key is saved, encrypt and save/rotate it, or delete it.
 - `GET /v1/workspaces`: list caller memberships (platform admins can list all).
+- `POST /v1/workspaces`: create a named workspace and initial admin membership.
+- `PATCH /v1/workspaces/{workspace_id}`: update name and description as a workspace admin.
+- `GET`, `POST /v1/workspaces/{workspace_id}/roles`: list or create workspace-local roles with explicit permissions.
 - `GET /v1/workspaces/{workspace_id}/members`: workspace-admin member listing.
 - `POST /v1/workspaces/{workspace_id}/members`: add a user with existing roles.
 - `PUT`, `DELETE /v1/workspaces/{workspace_id}/members/{user_id}`:
   update or remove a workspace member.
-- `POST /v1/workspaces/{workspace_id}/invitations` and
-  `POST /v1/invitations/{token}/accept`: send and accept verified-email
-  invitations.
-- `GET /v1/roles`, `POST /v1/roles`: read global roles; only platform admins
-  can define new ones.
+- `POST /v1/workspaces/{workspace_id}/invitations`: send a verified-email
+  invitation.
+- `POST /v1/invitations/accept`: accept an invitation using a token in the
+  JSON request body.
 
 Protected API calls require a bearer token when `OIDC_ISSUER_URL` is set.
-Workspace endpoints use current PostgreSQL membership, and privileged
+Workspace-scoped routes require an active workspace selection and use current
+PostgreSQL membership and permissions; listing/creating workspaces and
+accepting an invitation are identity-only operations. Privileged
 cross-workspace access is audited. Invitation messages are delivered through
 configured SMTP; local Compose uses Mailpit.
+The React Operations view displays dependency readiness and the read-only
+reindex dry-run report. Only platform administrators can view the report; it
+contains source names, digests, byte counts, and chunking strategies, not
+document contents or access-control metadata.
 
 For local development, set `API_KEY` to require `X-API-Key`. If
 `OIDC_ISSUER_URL` is configured, protected API routes require a verified bearer
@@ -348,9 +398,11 @@ uploads and immutable index generations are stored under `DATA_DIR`.
 
 - Without both `QDRANT_URL` and `DATABASE_URL`, FAISS `IndexFlatIP` stores normalized embeddings and supports exact cosine-ranked lookup on local disk. `chunks.json`, `vectors.npy`, and the FAISS index are committed as one generation behind an atomic pointer; BM25 is built from that snapshot.
 - With both settings, Qdrant stores dense vectors with workspace, owner, and role payloads, while PostgreSQL stores the current chunk catalog and indexed full-text search data. Both stores apply authorization filters before ranking. Dense candidates are checked against the current catalog before fusion so stale Qdrant points are not returned.
+- With a PostgreSQL `DATABASE_URL`, LangGraph conversation checkpoints and conversation metadata are durable across API process restarts. Checkpoint thread IDs are derived from the authenticated user, workspace, and server-generated conversation UUID; the request's legacy `thread_id` is not used as an authorization key. Without PostgreSQL, local/test operation retains in-memory checkpoints.
+- Redis provides atomic, per-user/workspace rate limits. Optional answers are cached only for stateless calls; checkpointed conversations always execute through the graph so history remains correct. Readiness reports PostgreSQL, Qdrant, and Redis dependency states without exposing connection details.
 - Durable ingestion writes accepted vectors, replaces the source's catalog rows in one database transaction, publishes the local snapshot, then removes superseded Qdrant point IDs. The Qdrant and PostgreSQL operations are not one cross-service transaction.
 - Duplicate chunks with cosine similarity above the configured threshold are skipped.
 - Confidence combines calibrated retrieval relevance, claim-level verified citation coverage, and an LLM completeness assessment. Low retrieval confidence returns a structured abstention.
-- Original uploads are content-addressed under `DATA_DIR/raw`; `rag-pipeline-reindex` re-embeds the current document manifest without re-uploading.
+- Original uploads are content-addressed under `DATA_DIR/raw`; `rag-pipeline-reindex --dry-run` verifies every archived source digest and prints the planned operation without changing the index. Run `rag-pipeline-reindex` to re-embed the manifest after the dry run.
 - The default reranker is `cross-encoder/ms-marco-MiniLM-L-6-v2`. It loads on the first query and may need network access to download model weights; disable it for a lightweight offline test using `RERANKER_ENABLED=false`.
 - The sample corpus is synthetic. Do not ingest confidential material into a demo environment.

@@ -25,6 +25,22 @@ from rag_pipeline.credentials import Base
 
 
 DEFAULT_ROLES = frozenset({"admin", "ceo", "employee", "hr"})
+DOCUMENT_PERMISSION_KEYS = frozenset(
+    {
+        "documents:read",
+        "documents:query",
+        "documents:upload",
+        "documents:update",
+    }
+)
+DEFAULT_ROLE_PERMISSIONS = {
+    "admin": DOCUMENT_PERMISSION_KEYS,
+    "ceo": frozenset({"documents:read", "documents:query", "documents:upload"}),
+    "employee": frozenset(
+        {"documents:read", "documents:query", "documents:upload"}
+    ),
+    "hr": frozenset({"documents:read", "documents:query", "documents:upload"}),
+}
 MEMBERSHIP_STATUSES = frozenset({"active", "suspended"})
 ROLE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,49}$")
 EMAIL_PATTERN = re.compile(
@@ -39,6 +55,9 @@ class Workspace(Base):
 
     id: Mapped[str] = mapped_column(String(512), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(
+        String(2000), nullable=False, default="", server_default=""
+    )
     personal_owner_id: Mapped[str | None] = mapped_column(
         String(255), unique=True, nullable=True
     )
@@ -51,6 +70,25 @@ class RoleDefinition(Base):
     __tablename__ = "role_definitions"
 
     name: Mapped[str] = mapped_column(String(100), primary_key=True)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class WorkspaceRole(Base):
+    __tablename__ = "workspace_roles"
+
+    workspace_id: Mapped[str] = mapped_column(
+        String(512),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    name: Mapped[str] = mapped_column(String(50), primary_key=True)
+    description: Mapped[str] = mapped_column(
+        String(500), nullable=False, default=""
+    )
+    permissions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
@@ -104,6 +142,7 @@ class WorkspaceInvitation(Base):
 class WorkspaceRecord:
     id: str
     name: str
+    description: str
     personal_owner_id: str | None
     created_at: datetime
 
@@ -120,6 +159,7 @@ class WorkspaceMembershipRecord:
 class WorkspaceSummaryRecord:
     id: str
     name: str
+    description: str
     roles: frozenset[str]
     status: str
     is_personal: bool
@@ -128,6 +168,16 @@ class WorkspaceSummaryRecord:
 @dataclass(frozen=True)
 class RoleDefinitionRecord:
     name: str
+    created_by: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class WorkspaceRoleRecord:
+    workspace_id: str
+    name: str
+    description: str
+    permissions: frozenset[str]
     created_by: str | None
     created_at: datetime
 
@@ -199,6 +249,7 @@ class WorkspaceStore:
         return WorkspaceRecord(
             id=workspace.id,
             name=workspace.name,
+            description=workspace.description,
             personal_owner_id=workspace.personal_owner_id,
             created_at=workspace.created_at,
         )
@@ -210,6 +261,33 @@ class WorkspaceStore:
             created_by=role.created_by,
             created_at=role.created_at,
         )
+
+    @staticmethod
+    def _workspace_role_record(role: WorkspaceRole) -> WorkspaceRoleRecord:
+        return WorkspaceRoleRecord(
+            workspace_id=role.workspace_id,
+            name=role.name,
+            description=role.description,
+            permissions=frozenset(role.permissions),
+            created_by=role.created_by,
+            created_at=role.created_at,
+        )
+
+    @staticmethod
+    def _seed_workspace_roles(
+        session: Session, workspace_id: str, created_by: str | None = None
+    ) -> None:
+        for name, permissions in DEFAULT_ROLE_PERMISSIONS.items():
+            if session.get(WorkspaceRole, (workspace_id, name)) is None:
+                session.add(
+                    WorkspaceRole(
+                        workspace_id=workspace_id,
+                        name=name,
+                        description="",
+                        permissions=sorted(permissions),
+                        created_by=created_by,
+                    )
+                )
 
     @staticmethod
     def _invitation_record(
@@ -236,6 +314,59 @@ class WorkspaceStore:
         )
         with Session(self._engine) as session, session.begin():
             session.add(workspace)
+            session.flush()
+            self._seed_workspace_roles(session, workspace.id)
+            session.flush()
+            return self._workspace_record(workspace)
+
+    def create_workspace_for_user(
+        self, user_id: str, name: str, description: str = ""
+    ) -> tuple[WorkspaceRecord, WorkspaceMembershipRecord]:
+        if not user_id.strip():
+            raise ValueError("User ID must not be empty.")
+        normalized_name = name.strip()
+        normalized_description = description.strip()
+        if not normalized_name or len(normalized_name) > 255:
+            raise ValueError("Workspace name must contain 1 to 255 characters.")
+        if len(normalized_description) > 2000:
+            raise ValueError("Workspace description must not exceed 2000 characters.")
+        workspace = Workspace(
+            id=str(uuid4()),
+            name=normalized_name,
+            description=normalized_description,
+        )
+        membership = WorkspaceMembership(
+            user_id=user_id,
+            workspace_id=workspace.id,
+            roles=["admin"],
+            status="active",
+        )
+        with Session(self._engine) as session, session.begin():
+            session.add(workspace)
+            session.flush()
+            self._seed_workspace_roles(session, workspace.id, user_id)
+            session.add(membership)
+            session.flush()
+            return (
+                self._workspace_record(workspace),
+                self._membership_record(membership),
+            )
+
+    def update_workspace(
+        self, workspace_id: str, name: str, description: str
+    ) -> WorkspaceRecord | None:
+        normalized_name = name.strip()
+        normalized_description = description.strip()
+        if not normalized_name or len(normalized_name) > 255:
+            raise ValueError("Workspace name must contain 1 to 255 characters.")
+        if len(normalized_description) > 2000:
+            raise ValueError("Workspace description must not exceed 2000 characters.")
+        with Session(self._engine) as session, session.begin():
+            workspace = session.get(Workspace, workspace_id)
+            if workspace is None:
+                return None
+            workspace.name = normalized_name
+            workspace.description = normalized_description
             session.flush()
             return self._workspace_record(workspace)
 
@@ -267,6 +398,8 @@ class WorkspaceStore:
                     )
                     session.add(membership)
                     session.flush()
+                self._seed_workspace_roles(session, workspace.id, user_id)
+                session.flush()
                 return self._membership_record(membership)
         except IntegrityError:
             membership = self.get_membership_for_personal_workspace(user_id)
@@ -310,8 +443,9 @@ class WorkspaceStore:
                 raise ValueError("Workspace does not exist.")
             known_roles = set(
                 session.scalars(
-                    select(RoleDefinition.name).where(
-                        RoleDefinition.name.in_(normalized_roles)
+                    select(WorkspaceRole.name).where(
+                        WorkspaceRole.workspace_id == workspace_id,
+                        WorkspaceRole.name.in_(normalized_roles),
                     )
                 )
             ) if normalized_roles else set()
@@ -399,6 +533,7 @@ class WorkspaceStore:
                 WorkspaceSummaryRecord(
                     id=workspace.id,
                     name=workspace.name,
+                    description=workspace.description,
                     roles=frozenset(membership.roles),
                     status=membership.status,
                     is_personal=workspace.personal_owner_id == user_id,
@@ -450,6 +585,77 @@ class WorkspaceStore:
             session.flush()
             return self._role_record(role)
 
+    def list_workspace_roles(self, workspace_id: str) -> list[WorkspaceRoleRecord]:
+        with Session(self._engine) as session:
+            roles = session.scalars(
+                select(WorkspaceRole)
+                .where(WorkspaceRole.workspace_id == workspace_id)
+                .order_by(WorkspaceRole.name)
+            )
+            return [self._workspace_role_record(role) for role in roles]
+
+    def create_workspace_role(
+        self,
+        workspace_id: str,
+        name: str,
+        description: str,
+        permissions: Iterable[str],
+        created_by: str,
+    ) -> WorkspaceRoleRecord:
+        if not ROLE_NAME_PATTERN.fullmatch(name):
+            raise ValueError("Role names must be lowercase slugs of at most 50 characters.")
+        if name == "admin":
+            raise ValueError("The admin role is reserved.")
+        normalized_description = description.strip()
+        if len(normalized_description) > 500:
+            raise ValueError("Role description must not exceed 500 characters.")
+        normalized_permissions = {permission.strip() for permission in permissions}
+        unknown_permissions = normalized_permissions - DOCUMENT_PERMISSION_KEYS
+        if unknown_permissions:
+            raise ValueError(
+                f"Unknown permission: {', '.join(sorted(unknown_permissions))}"
+            )
+        role = WorkspaceRole(
+            workspace_id=workspace_id,
+            name=name,
+            description=normalized_description,
+            permissions=sorted(normalized_permissions),
+            created_by=created_by,
+        )
+        with Session(self._engine) as session, session.begin():
+            if session.get(Workspace, workspace_id) is None:
+                raise ValueError("Workspace does not exist.")
+            session.add(role)
+            session.flush()
+            return self._workspace_role_record(role)
+
+    def get_role_permissions(
+        self, workspace_id: str, roles: Iterable[str]
+    ) -> frozenset[str]:
+        normalized_roles = {role.strip() for role in roles}
+        if not normalized_roles:
+            return frozenset()
+        with Session(self._engine) as session:
+            definitions = list(
+                session.scalars(
+                    select(WorkspaceRole).where(
+                        WorkspaceRole.workspace_id == workspace_id,
+                        WorkspaceRole.name.in_(normalized_roles),
+                    )
+                )
+            )
+        found_roles = {definition.name for definition in definitions}
+        unknown_roles = normalized_roles - found_roles
+        if unknown_roles:
+            raise ValueError(
+                f"Unknown workspace role: {', '.join(sorted(unknown_roles))}"
+            )
+        return frozenset(
+            permission
+            for definition in definitions
+            for permission in definition.permissions
+        )
+
     def create_invitation(
         self,
         workspace_id: str,
@@ -485,8 +691,9 @@ class WorkspaceStore:
                 raise ValueError("Workspace does not exist.")
             known_roles = set(
                 session.scalars(
-                    select(RoleDefinition.name).where(
-                        RoleDefinition.name.in_(normalized_roles)
+                    select(WorkspaceRole.name).where(
+                        WorkspaceRole.workspace_id == workspace_id,
+                        WorkspaceRole.name.in_(normalized_roles),
                     )
                 )
             )

@@ -7,7 +7,7 @@ import secrets
 from typing import Annotated, Literal
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -78,8 +78,36 @@ class InvitationCreateRequest(BaseModel):
         return roles
 
 
+class InvitationAcceptRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=128)
+
+
+class WorkspaceCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str = Field(default="", max_length=2000)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Workspace name must not be empty.")
+        return normalized
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        return value.strip()
+
+
+class WorkspaceUpdateRequest(WorkspaceCreateRequest):
+    pass
+
+
 class RoleCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=50)
+    description: str = Field(default="", max_length=500)
+    permissions: list[str] = Field(default_factory=list, max_length=4)
 
     @field_validator("name")
     @classmethod
@@ -89,11 +117,23 @@ class RoleCreateRequest(BaseModel):
             raise ValueError("Role names must be lowercase slugs of at most 50 characters.")
         return name
 
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("permissions")
+    @classmethod
+    def normalize_permissions(cls, values: list[str]) -> list[str]:
+        return sorted({permission.strip() for permission in values})
+
 
 class WorkspaceResponse(BaseModel):
     id: str
     name: str
+    description: str = ""
     roles: list[str]
+    permissions: list[str] = Field(default_factory=list)
     status: str | None
     is_personal: bool
 
@@ -106,7 +146,10 @@ class WorkspaceMemberResponse(BaseModel):
 
 
 class RoleResponse(BaseModel):
+    workspace_id: str
     name: str
+    description: str
+    permissions: list[str]
     created_by: str | None
     created_at: datetime
 
@@ -124,6 +167,9 @@ def create_workspace_router(
     settings: Settings,
     authorize: Callable[..., WorkspaceAccessContext],
     authenticate: Callable[..., VerifiedIdentity],
+    audit_platform_access: Callable[
+        [VerifiedIdentity, Request, str, str | None], None
+    ],
 ) -> APIRouter:
     router = APIRouter(prefix="/v1")
 
@@ -160,42 +206,138 @@ def create_workspace_router(
 
     @router.get("/workspaces", response_model=list[WorkspaceResponse])
     def list_workspaces(
-        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
+        request: Request,
+        identity: Annotated[VerifiedIdentity, Depends(authenticate)],
     ) -> list[WorkspaceResponse]:
         workspace_store = require_store()
+        audit_platform_access(
+            identity, request, "GET /v1/workspaces", workspace_id=None
+        )
         try:
-            if not access_context.platform_admin:
+            if not identity.platform_admin:
                 return [
                     WorkspaceResponse(
                         id=workspace.id,
                         name=workspace.name,
+                        description=workspace.description,
                         roles=sorted(workspace.roles),
+                        permissions=sorted(
+                            workspace_store.get_role_permissions(
+                                workspace.id, workspace.roles
+                            )
+                        ),
                         status=workspace.status,
                         is_personal=workspace.is_personal,
                     )
-                    for workspace in workspace_store.list_user_workspaces(access_context.user_id)
+                    for workspace in workspace_store.list_user_workspaces(identity.user_id)
                 ]
             memberships = {
                 membership.workspace_id: membership
-                for membership in workspace_store.list_memberships(access_context.user_id)
+                for membership in workspace_store.list_memberships(identity.user_id)
             }
-            return [
-                WorkspaceResponse(
-                    id=workspace.id,
-                    name=workspace.name,
-                    roles=sorted(memberships[workspace.id].roles)
-                    if workspace.id in memberships
-                    else [],
-                    status=memberships[workspace.id].status
-                    if workspace.id in memberships
-                    else None,
-                    is_personal=workspace.personal_owner_id == access_context.user_id,
+            response: list[WorkspaceResponse] = []
+            for workspace in workspace_store.list_workspaces():
+                membership = memberships.get(workspace.id)
+                roles = (
+                    membership.roles
+                    if membership is not None and membership.status == "active"
+                    else frozenset()
                 )
-                for workspace in workspace_store.list_workspaces()
-            ]
+                response.append(
+                    WorkspaceResponse(
+                        id=workspace.id,
+                        name=workspace.name,
+                        description=workspace.description,
+                        roles=sorted(membership.roles) if membership is not None else [],
+                        permissions=sorted(
+                            workspace_store.get_role_permissions(workspace.id, roles)
+                        ),
+                        status=membership.status if membership is not None else None,
+                        is_personal=workspace.personal_owner_id == identity.user_id,
+                    )
+                )
+            return response
         except SQLAlchemyError as error:
             raise HTTPException(
                 status_code=503, detail="Unable to list workspaces."
+            ) from error
+
+    @router.post(
+        "/workspaces",
+        response_model=WorkspaceResponse,
+        status_code=201,
+    )
+    def create_workspace(
+        request: Request,
+        workspace_request: WorkspaceCreateRequest,
+        identity: Annotated[VerifiedIdentity, Depends(authenticate)],
+    ) -> WorkspaceResponse:
+        workspace_store = require_store()
+        try:
+            workspace, membership = workspace_store.create_workspace_for_user(
+                identity.user_id,
+                workspace_request.name,
+                workspace_request.description,
+            )
+            audit_platform_access(
+                identity,
+                request,
+                "POST /v1/workspaces",
+                workspace_id=workspace.id,
+            )
+            return WorkspaceResponse(
+                id=workspace.id,
+                name=workspace.name,
+                description=workspace.description,
+                roles=sorted(membership.roles),
+                permissions=sorted(
+                    workspace_store.get_role_permissions(
+                        workspace.id, membership.roles
+                    )
+                ),
+                status=membership.status,
+                is_personal=False,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="Unable to create workspace."
+            ) from error
+
+    @router.patch(
+        "/workspaces/{workspace_id}",
+        response_model=WorkspaceResponse,
+    )
+    def update_workspace(
+        workspace_id: str,
+        workspace_request: WorkspaceUpdateRequest,
+        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
+    ) -> WorkspaceResponse:
+        require_workspace_admin(access_context, workspace_id)
+        workspace_store = require_store()
+        try:
+            workspace = workspace_store.update_workspace(
+                workspace_id,
+                workspace_request.name,
+                workspace_request.description,
+            )
+            if workspace is None:
+                raise HTTPException(status_code=404, detail="Workspace not found.")
+            return WorkspaceResponse(
+                id=workspace.id,
+                name=workspace.name,
+                description=workspace.description,
+                roles=sorted(access_context.roles),
+                permissions=sorted(access_context.permissions),
+                status="active",
+                is_personal=workspace.personal_owner_id == access_context.user_id,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except SQLAlchemyError as error:
+            raise HTTPException(
+                status_code=503, detail="Unable to update workspace."
             ) from error
 
     @router.get(
@@ -297,39 +439,64 @@ def create_workspace_router(
                 status_code=503, detail="Unable to remove workspace member."
             ) from error
 
-    @router.get("/roles", response_model=list[RoleResponse])
-    def list_roles(
-        _access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
+    @router.get(
+        "/workspaces/{workspace_id}/roles",
+        response_model=list[RoleResponse],
+    )
+    def list_workspace_roles(
+        workspace_id: str,
+        access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
     ) -> list[RoleResponse]:
+        if not access_context.platform_admin and access_context.workspace_id != workspace_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Workspace membership is required to list its roles.",
+            )
         workspace_store = require_store()
         try:
+            if workspace_store.get_workspace(workspace_id) is None:
+                raise HTTPException(status_code=404, detail="Workspace not found.")
             return [
                 RoleResponse(
+                    workspace_id=role.workspace_id,
                     name=role.name,
+                    description=role.description,
+                    permissions=sorted(role.permissions),
                     created_by=role.created_by,
                     created_at=role.created_at,
                 )
-                for role in workspace_store.list_roles()
+                for role in workspace_store.list_workspace_roles(workspace_id)
             ]
         except SQLAlchemyError as error:
             raise HTTPException(
                 status_code=503, detail="Unable to list role definitions."
             ) from error
 
-    @router.post("/roles", response_model=RoleResponse, status_code=201)
-    def create_role(
+    @router.post(
+        "/workspaces/{workspace_id}/roles",
+        response_model=RoleResponse,
+        status_code=201,
+    )
+    def create_workspace_role(
+        workspace_id: str,
         request: RoleCreateRequest,
         access_context: Annotated[WorkspaceAccessContext, Depends(authorize)],
     ) -> RoleResponse:
-        if not access_context.platform_admin:
-            raise HTTPException(
-                status_code=403, detail="Only platform admins can define roles."
-            )
+        require_workspace_admin(access_context, workspace_id)
         workspace_store = require_store()
         try:
-            role = workspace_store.create_role(request.name, access_context.user_id)
+            role = workspace_store.create_workspace_role(
+                workspace_id,
+                request.name,
+                request.description,
+                request.permissions,
+                access_context.user_id,
+            )
             return RoleResponse(
+                workspace_id=role.workspace_id,
                 name=role.name,
+                description=role.description,
+                permissions=sorted(role.permissions),
                 created_by=role.created_by,
                 created_at=role.created_at,
             )
@@ -375,7 +542,7 @@ def create_workspace_router(
                 status_code=503, detail="Unable to create workspace invitation."
             ) from error
         invite_url = (
-            f"{settings.web_base_url}/invite?"
+            f"{settings.web_base_url}/invite#"
             f"{urlencode({'token': token})}"
         )
         try:
@@ -406,12 +573,9 @@ def create_workspace_router(
             expires_at=invitation.expires_at,
         )
 
-    @router.post(
-        "/invitations/{token}/accept",
-        response_model=WorkspaceMemberResponse,
-    )
+    @router.post("/invitations/accept", response_model=WorkspaceMemberResponse)
     def accept_invitation(
-        token: Annotated[str, Path(min_length=32, max_length=128)],
+        request: InvitationAcceptRequest,
         identity: Annotated[VerifiedIdentity, Depends(authenticate)],
     ) -> WorkspaceMemberResponse:
         if not identity.email_verified or not identity.email:
@@ -421,7 +585,7 @@ def create_workspace_router(
         workspace_store = require_store()
         try:
             record = workspace_store.accept_invitation(
-                token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                token_hash=hashlib.sha256(request.token.encode("utf-8")).hexdigest(),
                 user_id=identity.user_id,
                 email=identity.email,
                 email_verified=identity.email_verified,

@@ -5,6 +5,7 @@
 .langgraph_api/
 __pycache__/
 .pytest_cache/
+.pytest-runtime.db
 .ruff_cache/
 .mypy_cache/
 *.py[cod]
@@ -13,6 +14,8 @@ data/evaluation/results/
 *.egg-info/
 build/
 dist/
+node_modules/
+coverage/
 .streamlit/secrets.toml
 INTERVIEW_CODE_RULES.md
 rag-pipeline-hybrid-search-internal-docs.md

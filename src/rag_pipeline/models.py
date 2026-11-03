@@ -1,6 +1,7 @@
 # models.py: defines typed document, retrieval, citation, and API response objects
 
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -9,6 +10,7 @@ class AccessContext(BaseModel):
     user_id: str
     workspace_id: str
     roles: frozenset[str] = Field(default_factory=frozenset)
+    permissions: frozenset[str] = Field(default_factory=frozenset)
     platform_admin: bool = False
 
     def permits(self, workspace_id: str, owner_id: str, required_roles: list[str]) -> bool:
@@ -102,6 +104,7 @@ class AnswerResponse(BaseModel):
     insufficient_context: bool
     documents_to_check: list[str]
     thread_id: str
+    conversation_id: UUID | None = None
 
 
 # Expose one document's indexed and source-file provenance.
@@ -115,6 +118,19 @@ class DocumentInfo(BaseModel):
     workspace_id: str = "local"
     owner_id: str = "local"
     required_roles: list[str] = Field(default_factory=list)
+
+
+class ReindexDryRunDocument(BaseModel):
+    source: str
+    source_sha256: str
+    bytes: int = Field(ge=0)
+    chunking_strategy: Literal["fixed", "recursive", "semantic"]
+
+
+class ReindexDryRunReport(BaseModel):
+    dry_run: Literal[True] = True
+    read_only: Literal[True] = True
+    documents: list[ReindexDryRunDocument]
 
 
 # Describe what ingestion changed, including duplicates skipped by cosine similarity.

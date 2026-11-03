@@ -8,16 +8,21 @@ services:
       OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}
       OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
       API_KEY: ${API_KEY:-}
-      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
-      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-http://localhost:8080/realms/hybrid-rag}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-http://keycloak:8080/realms/hybrid-rag/protocol/openid-connect/certs}
       OIDC_AUDIENCE: ${OIDC_AUDIENCE:-hybrid-rag-api}
       DATABASE_URL: ${DATABASE_URL:-}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1536}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379/0
+      REDIS_CACHE_TTL_SECONDS: ${REDIS_CACHE_TTL_SECONDS:-60}
+      REDIS_CACHE_MAX_VALUE_BYTES: ${REDIS_CACHE_MAX_VALUE_BYTES:-262144}
+      REDIS_RATE_LIMIT_REQUESTS: ${REDIS_RATE_LIMIT_REQUESTS:-120}
+      REDIS_RATE_LIMIT_WINDOW_SECONDS: ${REDIS_RATE_LIMIT_WINDOW_SECONDS:-60}
       USER_KEY_ENCRYPTION_KEY: ${USER_KEY_ENCRYPTION_KEY:?Run scripts/init_local_env.py to generate local secrets}
       DATA_DIR: /app/data/runtime
       RERANKER_ENABLED: ${RERANKER_ENABLED:-true}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8501}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:5173}
       INVITATION_EXPIRY_HOURS: ${INVITATION_EXPIRY_HOURS:-72}
       SMTP_HOST: ${SMTP_HOST:-mailpit}
@@ -41,6 +46,8 @@ services:
         condition: service_healthy
       mailpit:
         condition: service_started
+      keycloak:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD
@@ -53,20 +60,26 @@ services:
       start_period: 30s
 
   dashboard:
-    build: .
-    command: streamlit run src/rag_pipeline/ui.py --server.address 0.0.0.0 --server.port 8501
+    build:
+      context: ./web
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+        VITE_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}
+        VITE_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hybrid-rag}
+        VITE_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_WEB_CLIENT_ID:-hybrid-rag-web}
     environment:
-      STREAMLIT_API_URL: http://api:8000
-      STREAMLIT_API_KEY: ${API_KEY:-}
-      STREAMLIT_OIDC_ENABLED: ${STREAMLIT_OIDC_ENABLED:-false}
-      STREAMLIT_USER_KEYS_ENABLED: ${STREAMLIT_USER_KEYS_ENABLED:-true}
+      KEYCLOAK_PUBLIC_ORIGIN: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}
+      NGINX_ENVSUBST_FILTER: ^KEYCLOAK_PUBLIC_ORIGIN$
     ports:
-      - "127.0.0.1:8501:8501"
-    volumes:
-      - ./.streamlit:/app/.streamlit:ro
+      - "127.0.0.1:5173:80"
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   postgres:
     image: postgres:17-alpine

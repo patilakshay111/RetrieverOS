@@ -617,6 +617,63 @@ def test_document_acl_blocks_unauthorized_replacement_before_embedding(tmp_path)
     assert knowledge_base.list_documents(owner)[0].owner_id == "owner"
 
 
+def test_denied_racing_upload_does_not_archive_raw_content(tmp_path, monkeypatch):
+    from rag_pipeline.models import AccessContext
+
+    settings = replace(
+        Settings.from_env(),
+        data_dir=tmp_path,
+        reranker_enabled=False,
+        chunk_size=1000,
+        chunk_overlap=0,
+    )
+    knowledge_base = KnowledgeBase(settings, FakeEmbeddings())
+    uploader = AccessContext(
+        user_id="uploader",
+        workspace_id="workspace-a",
+        roles=frozenset({"employee"}),
+        permissions=frozenset({"documents:upload"}),
+    )
+    writer = AccessContext(
+        user_id="writer",
+        workspace_id="workspace-a",
+        roles=frozenset({"admin"}),
+        permissions=frozenset(
+            {"documents:upload", "documents:update"}
+        ),
+    )
+    unauthorized_content = b"An upload racing with document creation."
+    original_load_document = load_document
+    concurrent_write_started = False
+
+    def create_document_during_parse(filename, content):
+        nonlocal concurrent_write_started
+        if not concurrent_write_started and content == unauthorized_content:
+            concurrent_write_started = True
+            knowledge_base.ingest(
+                filename,
+                b"The concurrent authorized document.",
+                "recursive",
+                writer,
+                ["employee"],
+            )
+        return original_load_document(filename, content)
+
+    monkeypatch.setattr("rag_pipeline.storage.load_document", create_document_during_parse)
+
+    with pytest.raises(PermissionError, match="documents:update"):
+        knowledge_base.ingest(
+            "policy.md",
+            unauthorized_content,
+            "recursive",
+            uploader,
+            ["employee"],
+        )
+
+    unauthorized_digest = hashlib.sha256(unauthorized_content).hexdigest()
+    assert not knowledge_base.raw_path("policy.md", unauthorized_digest).exists()
+
+
 # Verify dense and sparse retrieval never return evidence outside the caller's document ACL.
 def test_retrieval_excludes_documents_outside_workspace_and_roles(tmp_path):
     from rag_pipeline.models import AccessContext
@@ -739,6 +796,55 @@ def test_retrieval_acl_lexical_store_filters_workspace_owner_and_roles():
 
     assert {item.chunk.chunk_id for item in results} == {"owner", "role"}
     assert [item.rank for item in results] == [1, 2]
+    store.close()
+
+
+def test_retrieval_acl_lexical_store_escapes_sqlite_like_wildcards():
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
+
+    from rag_pipeline.credentials import Base
+    from rag_pipeline.lexical_store import LexicalStore
+    from rag_pipeline.models import WorkspaceAccessContext
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    store = LexicalStore("sqlite://", engine=engine)
+    chunks = [
+        Chunk(
+            chunk_id=chunk_id,
+            text=text,
+            source="same.md",
+            source_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            chunk_index=index,
+            chunking_strategy="recursive",
+            character_count=len(text),
+            workspace_id="workspace-a",
+            owner_id="alice",
+            required_roles=[],
+        )
+        for index, (chunk_id, text) in enumerate(
+            [
+                ("literal", "annual_report policy"),
+                ("wildcard", "annualXreport policy"),
+            ]
+        )
+    ]
+    store.replace_document("workspace-a", "same.md", chunks)
+
+    results = store.search(
+        "annual_report",
+        WorkspaceAccessContext(
+            user_id="alice", workspace_id="workspace-a", roles=frozenset()
+        ),
+        limit=10,
+    )
+
+    assert [item.chunk.chunk_id for item in results] == ["literal"]
     store.close()
 
 
@@ -865,6 +971,7 @@ def test_retrieval_acl_ingestion_and_hybrid_search_use_shared_stores(tmp_path):
         user_id="hr-owner",
         workspace_id="workspace-a",
         roles=frozenset({"hr"}),
+        permissions=frozenset({"documents:upload", "documents:update"}),
     )
     employee = WorkspaceAccessContext(
         user_id="employee",
@@ -875,6 +982,7 @@ def test_retrieval_acl_ingestion_and_hybrid_search_use_shared_stores(tmp_path):
         user_id="hr-owner",
         workspace_id="workspace-b",
         roles=frozenset({"hr"}),
+        permissions=frozenset({"documents:upload", "documents:update"}),
     )
     hr_content = b"Salary compensation bands are confidential to HR."
     other_content = b"Salary compensation bands in the other workspace."
@@ -989,7 +1097,10 @@ def test_api_returns_service_unavailable_for_lexical_database_errors(monkeypatch
         raise SQLAlchemyError("catalog database is offline")
 
     fake_service = SimpleNamespace(
-        knowledge_base=SimpleNamespace(ingest=unavailable),
+        knowledge_base=SimpleNamespace(
+            ingest=unavailable,
+            get_document=lambda *_args: None,
+        ),
         ask=unavailable,
     )
     settings = replace(
@@ -1031,7 +1142,10 @@ def test_api_returns_service_unavailable_for_qdrant_ingestion_errors():
         raise RuntimeError("Unable to write vectors to Qdrant.")
 
     fake_service = SimpleNamespace(
-        knowledge_base=SimpleNamespace(ingest=qdrant_unavailable),
+        knowledge_base=SimpleNamespace(
+            ingest=qdrant_unavailable,
+            get_document=lambda *_args: None,
+        ),
     )
     settings = replace(
         Settings.from_env(),
@@ -1054,6 +1168,994 @@ def test_api_returns_service_unavailable_for_qdrant_ingestion_errors():
         )
 
     assert response.status_code == 503
+
+
+def test_conversation_store_isolates_user_workspace_and_persists_metadata(tmp_path):
+    from uuid import UUID
+
+    from rag_pipeline.conversations import ConversationStore
+    from rag_pipeline.models import WorkspaceAccessContext
+
+    database_url = f"sqlite:///{tmp_path / 'conversations.db'}"
+    owner = WorkspaceAccessContext(
+        user_id="alice", workspace_id="workspace-a", roles=frozenset({"employee"})
+    )
+    other_user = owner.model_copy(update={"user_id": "bob"})
+    other_workspace = owner.model_copy(update={"workspace_id": "workspace-b"})
+
+    store = ConversationStore(database_url)
+    conversation = store.create(owner, "Incident response")
+    assert isinstance(conversation.conversation_id, UUID)
+    assert conversation.title == "Incident response"
+    assert store.list(owner) == [conversation]
+    assert store.get(owner, conversation.conversation_id) == conversation
+    assert store.get(other_user, conversation.conversation_id) is None
+    assert store.get(other_workspace, conversation.conversation_id) is None
+    assert not store.delete(other_user, conversation.conversation_id)
+    store.close()
+
+    reopened_store = ConversationStore(database_url)
+    assert reopened_store.list(owner) == [conversation]
+    assert reopened_store.delete(owner, conversation.conversation_id)
+    assert reopened_store.get(owner, conversation.conversation_id) is None
+    reopened_store.close()
+
+
+def test_conversation_thread_id_is_derived_from_server_scope():
+    from uuid import UUID, uuid4
+
+    from rag_pipeline.conversations import conversation_thread_id
+    from rag_pipeline.models import WorkspaceAccessContext
+
+    conversation_id = uuid4()
+    owner = WorkspaceAccessContext(
+        user_id="alice", workspace_id="workspace-a", roles=frozenset({"employee"})
+    )
+
+    owner_thread = conversation_thread_id(owner, conversation_id)
+
+    assert UUID(owner_thread)
+    assert conversation_thread_id(owner, conversation_id) == owner_thread
+    assert conversation_thread_id(
+        owner.model_copy(update={"user_id": "bob"}), conversation_id
+    ) != owner_thread
+    assert conversation_thread_id(
+        owner.model_copy(update={"workspace_id": "workspace-b"}), conversation_id
+    ) != owner_thread
+
+
+def test_postgres_checkpointer_uses_managed_pool_and_runs_setup(monkeypatch):
+    from rag_pipeline import checkpointing
+
+    calls = {}
+
+    class FakePool:
+        def __init__(self, conninfo, **options):
+            calls["conninfo"] = conninfo
+            calls["options"] = options
+            self.closed = False
+
+        def open(self, **options):
+            calls["open"] = options
+
+        def close(self):
+            self.closed = True
+
+    class FakeSaver:
+        def __init__(self, pool):
+            self.pool = pool
+
+        def setup(self):
+            calls["setup"] = True
+
+    monkeypatch.setattr(checkpointing, "ConnectionPool", FakePool)
+    monkeypatch.setattr(checkpointing, "PostgresSaver", FakeSaver)
+
+    managed = checkpointing.create_postgres_checkpointer(
+        "postgresql+psycopg://rag:secret@db.example.test:5432/rag"
+    )
+
+    assert calls["conninfo"].startswith("postgresql://")
+    assert calls["options"]["kwargs"]["autocommit"] is True
+    assert calls["open"]["wait"] is True
+    assert calls["setup"] is True
+    assert managed.saver.pool is managed.pool
+    managed.close()
+    assert managed.pool.closed
+
+
+def test_redis_answer_cache_scopes_entries_and_enforces_ttl_and_size():
+    from rag_pipeline.cache import RedisAnswerCache, cache_key
+    from rag_pipeline.models import AnswerResponse, WorkspaceAccessContext
+
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+            self.expiries = {}
+            self.now = 0
+
+        def get(self, key):
+            if self.expiries.get(key, 0) <= self.now:
+                self.values.pop(key, None)
+                self.expiries.pop(key, None)
+                return None
+            return self.values.get(key)
+
+        def set(self, key, value, ex):
+            self.values[key] = value
+            self.expiries[key] = self.now + ex
+            return True
+
+    scope = WorkspaceAccessContext(
+        user_id="alice", workspace_id="workspace-a", roles=frozenset({"employee"})
+    )
+    key = cache_key("secret prompt", "hybrid", scope, "generation-1")
+    assert key != cache_key("secret prompt", "hybrid", scope, "generation-2")
+    assert key != cache_key(
+        "secret prompt",
+        "hybrid",
+        scope.model_copy(update={"user_id": "bob"}),
+        "generation-1",
+    )
+    assert key != cache_key(
+        "secret prompt",
+        "hybrid",
+        scope.model_copy(update={"workspace_id": "workspace-b"}),
+        "generation-1",
+    )
+    assert key != cache_key(
+        "secret prompt",
+        "hybrid",
+        scope.model_copy(update={"roles": frozenset({"hr"})}),
+        "generation-1",
+    )
+    assert "secret prompt" not in key
+    assert "alice" not in key
+
+    redis_client = FakeRedis()
+    cache = RedisAnswerCache(redis_client, ttl_seconds=120, max_value_bytes=4096)
+    response = AnswerResponse(
+        question="secret prompt",
+        answer="The safe answer.",
+        retrieval_mode="hybrid",
+        citations=[],
+        retrieved_chunks=[],
+        confidence=0.5,
+        confidence_breakdown={},
+        insufficient_context=False,
+        documents_to_check=[],
+        thread_id="server-thread",
+    )
+
+    assert cache.get(key) is None
+    assert cache.set(key, response)
+    assert cache.get(key) == response
+    assert redis_client.expiries[key] == 120
+    redis_client.now = 120
+    assert cache.get(key) is None
+
+    tiny_cache = RedisAnswerCache(FakeRedis(), max_value_bytes=10)
+    assert not tiny_cache.set(key, response)
+    assert tiny_cache.get(key) is None
+
+
+def test_redis_rate_limiter_uses_hashed_scopes_and_denies_over_limit():
+    from rag_pipeline.models import WorkspaceAccessContext
+    from rag_pipeline.rate_limits import RedisRateLimiter, rate_limit_key
+
+    class FakeRedis:
+        def __init__(self):
+            self.counts = {}
+
+        def eval(self, script, key_count, key, window_seconds):
+            assert key_count == 1
+            assert "INCR" in script and "EXPIRE" in script
+            self.counts[key] = self.counts.get(key, 0) + 1
+            return self.counts[key]
+
+    scope = WorkspaceAccessContext(
+        user_id="alice", workspace_id="workspace-a", roles=frozenset({"employee"})
+    )
+    limiter = RedisRateLimiter(FakeRedis(), requests=2, window_seconds=60)
+
+    assert limiter.allow(scope, "ask")
+    assert limiter.allow(scope, "ask")
+    assert not limiter.allow(scope, "ask")
+    assert rate_limit_key(scope, "ask") != rate_limit_key(
+        scope.model_copy(update={"workspace_id": "workspace-b"}), "ask"
+    )
+    assert rate_limit_key(scope, "ask") != rate_limit_key(scope, "ingest")
+    assert "alice" not in rate_limit_key(scope, "ask")
+    assert "workspace-a" not in rate_limit_key(scope, "ask")
+
+
+def test_ask_endpoint_enforces_shared_redis_rate_limit(monkeypatch):
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+    from rag_pipeline.models import AnswerResponse
+
+    class FakeRedis:
+        def __init__(self):
+            self.count = 0
+
+        def eval(self, *_args):
+            self.count += 1
+            return self.count
+
+        def close(self):
+            pass
+
+    calls = []
+
+    def ask(question, retrieval_mode, thread_id, access_context, api_key, **_kwargs):
+        calls.append(question)
+        return AnswerResponse(
+            question=question,
+            answer="Grounded answer.",
+            retrieval_mode=retrieval_mode,
+            citations=[],
+            retrieved_chunks=[],
+            confidence=0.0,
+            confidence_breakdown={},
+            insufficient_context=False,
+            documents_to_check=[],
+            thread_id=thread_id,
+        )
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        api_key=None,
+        database_url=None,
+        user_key_encryption_key=None,
+        qdrant_url=None,
+        redis_url="redis://redis.example.test:6379/0",
+        redis_rate_limit_requests=1,
+        openai_api_key="test-key",
+    )
+    fake_redis = FakeRedis()
+    with (
+        patch("rag_pipeline.api.Redis.from_url", return_value=fake_redis),
+        TestClient(
+            create_app(
+                settings=settings,
+                service=SimpleNamespace(ask=ask),
+            )
+        ) as client,
+    ):
+        first = client.post("/v1/ask", json={"question": "first"})
+        second = client.post("/v1/ask", json={"question": "second"})
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert calls == ["first"]
+
+
+def test_ask_uses_answer_cache_only_for_stateless_service(tmp_path):
+    from fastapi.testclient import TestClient
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+    from rag_pipeline.models import AnswerResponse
+    from rag_pipeline.service import RAGService
+
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+            self.counts = {}
+
+        def eval(self, _script, _key_count, key, _window):
+            self.counts[key] = self.counts.get(key, 0) + 1
+            return self.counts[key]
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value, ex):
+            self.values[key] = value
+            assert ex == 60
+            return True
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+        def close(self):
+            pass
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        database_url=None,
+        user_key_encryption_key=None,
+        qdrant_url=None,
+        redis_url="redis://redis.example.test:6379/0",
+        openai_api_key="test-key",
+        data_dir=tmp_path,
+        reranker_enabled=False,
+    )
+    service = RAGService(settings, use_memory_saver=False)
+    calls = []
+
+    def ask(question, retrieval_mode, thread_id, _scope, _api_key, **_kwargs):
+        calls.append(question)
+        return AnswerResponse(
+            question=question,
+            answer="Grounded answer.",
+            retrieval_mode=retrieval_mode,
+            citations=[],
+            retrieved_chunks=[],
+            confidence=0.0,
+            confidence_breakdown={},
+            insufficient_context=False,
+            documents_to_check=[],
+            thread_id=thread_id,
+        )
+
+    service.ask = ask
+    fake_redis = FakeRedis()
+    with (
+        patch("rag_pipeline.api.Redis.from_url", return_value=fake_redis),
+        TestClient(create_app(settings=settings, service=service)) as client,
+    ):
+        first = client.post("/v1/ask", json={"question": "same question"})
+        second = client.post("/v1/ask", json={"question": "same question"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json() == second.json()
+    assert calls == ["same question"]
+    assert all("same question" not in key for key in fake_redis.values)
+
+
+def test_readiness_checks_postgres_qdrant_and_redis(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+
+    class FakeRedis:
+        def ping(self):
+            return True
+
+        def close(self):
+            pass
+
+    class FakeVectorStore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def check(self):
+            return None
+
+        def close(self):
+            pass
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        database_url="postgresql+psycopg://user:password@postgres.example.test/rag",
+        user_key_encryption_key="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=",
+        qdrant_url="http://qdrant.example.test:6333",
+        redis_url="redis://redis.example.test:6379/0",
+    )
+    managed_checkpointer = SimpleNamespace(saver=object(), close=lambda: None)
+    fake_store = SimpleNamespace(check=lambda: None, close=lambda: None)
+    with (
+        patch("rag_pipeline.api.VectorStore", FakeVectorStore),
+        patch("rag_pipeline.api.Redis.from_url", return_value=FakeRedis()),
+        patch(
+            "rag_pipeline.api.create_postgres_checkpointer",
+            return_value=managed_checkpointer,
+        ),
+        patch("rag_pipeline.api.UserCredentialStore", return_value=fake_store),
+        patch("rag_pipeline.api.WorkspaceStore", return_value=fake_store),
+        patch("rag_pipeline.api.AdminAuditStore", return_value=fake_store),
+        patch("rag_pipeline.api.ConversationStore", return_value=fake_store),
+        TestClient(create_app(settings=settings)) as client,
+    ):
+        response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "dependencies": {
+            "postgres": "ready",
+            "qdrant": "ready",
+            "redis": "ready",
+        },
+    }
+
+
+def test_readiness_reports_configured_dependency_failure(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    from sqlalchemy.exc import SQLAlchemyError
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+
+    class FakeRedis:
+        def ping(self):
+            from redis.exceptions import ConnectionError
+
+            raise ConnectionError("redis is offline")
+
+        def close(self):
+            pass
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        database_url="postgresql+psycopg://user:password@postgres.example.test/rag",
+        user_key_encryption_key="MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=",
+        qdrant_url=None,
+        redis_url="redis://redis.example.test:6379/0",
+    )
+    managed_checkpointer = SimpleNamespace(saver=object(), close=lambda: None)
+    fake_store = SimpleNamespace(check=None, close=lambda: None)
+    def database_unavailable():
+        raise SQLAlchemyError("database unavailable")
+
+    credential_store = SimpleNamespace(check=database_unavailable, close=lambda: None)
+    with (
+        patch("rag_pipeline.api.Redis.from_url", return_value=FakeRedis()),
+        patch(
+            "rag_pipeline.api.create_postgres_checkpointer",
+            return_value=managed_checkpointer,
+        ),
+        patch("rag_pipeline.api.UserCredentialStore", return_value=credential_store),
+        patch("rag_pipeline.api.WorkspaceStore", return_value=fake_store),
+        patch("rag_pipeline.api.AdminAuditStore", return_value=fake_store),
+        patch("rag_pipeline.api.ConversationStore", return_value=fake_store),
+        TestClient(create_app(settings=settings)) as client,
+    ):
+        response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "status": "not_ready",
+        "dependencies": {
+            "postgres": "unavailable",
+            "qdrant": "not_configured",
+            "redis": "unavailable",
+        },
+    }
+
+
+def test_production_readiness_requires_redis():
+    from cryptography.fernet import Fernet
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="production",
+        web_base_url="https://app.example.test",
+        api_key=None,
+        qdrant_url="http://qdrant.example.test:6333",
+        oidc_issuer_url="https://identity.example.test/realms/rag",
+        database_url="postgresql://localhost/rag",
+        user_key_encryption_key=Fernet.generate_key().decode("ascii"),
+        redis_url="redis://redis.example.test:6379/0",
+    )
+    class OfflineRedis:
+        def ping(self):
+            from redis.exceptions import ConnectionError
+
+            raise ConnectionError("redis is offline")
+
+        def close(self):
+            pass
+
+    fake_store = SimpleNamespace(check=lambda: None, close=lambda: None)
+    fake_vector_store = SimpleNamespace(check=lambda: None, close=lambda: None)
+    managed_checkpointer = SimpleNamespace(saver=object(), close=lambda: None)
+    with (
+        patch("rag_pipeline.api.UserCredentialStore", return_value=fake_store),
+        patch("rag_pipeline.api.WorkspaceStore", return_value=fake_store),
+        patch("rag_pipeline.api.AdminAuditStore", return_value=fake_store),
+        patch("rag_pipeline.api.ConversationStore", return_value=fake_store),
+        patch("rag_pipeline.api.VectorStore", return_value=fake_vector_store),
+        patch(
+            "rag_pipeline.api.create_postgres_checkpointer",
+            return_value=managed_checkpointer,
+        ),
+        patch("rag_pipeline.api.Redis.from_url", return_value=OfflineRedis()),
+        TestClient(create_app(settings=settings)) as client,
+    ):
+        response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["dependencies"]["redis"] == "unavailable"
+
+
+def test_reindex_dry_run_verifies_sources_without_ingesting(
+    monkeypatch, capsys, tmp_path
+):
+    import hashlib
+    import json
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rag_pipeline.reindex import main
+
+    content = b"# Verified source"
+    digest = hashlib.sha256(content).hexdigest()
+    document = SimpleNamespace(
+        source="policy.md",
+        source_sha256=digest,
+        chunking_strategy="recursive",
+        workspace_id="workspace-a",
+        owner_id="alice",
+        required_roles=["employee"],
+    )
+    source_path = tmp_path / "policy.md"
+    source_path.write_bytes(content)
+    ingest_calls = []
+
+    class FakeKnowledgeBase:
+        def list_documents(self):
+            return [document]
+
+        def raw_path(self, source, source_digest):
+            assert source == document.source
+            assert source_digest == document.source_sha256
+            return source_path
+
+        def ingest(self, *args, **kwargs):
+            ingest_calls.append((args, kwargs))
+
+    fake_service = SimpleNamespace(
+        knowledge_base=FakeKnowledgeBase(), close=lambda: None
+    )
+    monkeypatch.setattr(sys, "argv", ["rag-pipeline-reindex", "--dry-run"])
+    with patch("rag_pipeline.reindex.RAGService", return_value=fake_service):
+        main()
+
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
+        "dry_run": True,
+        "documents": [
+            {
+                "source": "policy.md",
+                "source_sha256": digest,
+                "bytes": len(content),
+                "workspace_id": "workspace-a",
+                "owner_id": "alice",
+                "required_roles": ["employee"],
+                "chunking_strategy": "recursive",
+            }
+        ],
+    }
+    assert ingest_calls == []
+
+
+def test_verify_archived_sources_streams_without_returning_source_bytes(
+    monkeypatch, tmp_path
+):
+    import hashlib
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from rag_pipeline.reindex import verify_archived_sources
+
+    content = b"A large archived source"
+    digest = hashlib.sha256(content).hexdigest()
+    document = SimpleNamespace(
+        source="policy.md",
+        source_sha256=digest,
+        chunking_strategy="recursive",
+    )
+    source_path = tmp_path / "policy.md"
+    source_path.write_bytes(content)
+    knowledge_base = SimpleNamespace(
+        list_documents=lambda: [document],
+        raw_path=lambda _source, _digest: source_path,
+    )
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _path: pytest.fail("archive verification must stream source bytes"),
+    )
+
+    assert verify_archived_sources(knowledge_base) == [(document, len(content))]
+
+
+def test_operations_dry_run_requires_platform_admin(workspace_api):
+    endpoint = "/v1/admin/operations/reindex-dry-run"
+
+    assert workspace_api.client.get(endpoint).status_code == 401
+    response = workspace_api.client.get(
+        endpoint, headers={"Authorization": "Bearer employee-token"}
+    )
+
+    assert response.status_code == 403
+
+
+def test_operations_dry_run_returns_verified_metadata_without_ingesting(
+    workspace_api, tmp_path
+):
+    import hashlib
+    from types import SimpleNamespace
+
+    content = b"secret document contents"
+    digest = hashlib.sha256(content).hexdigest()
+    document = SimpleNamespace(
+        source="policy.md",
+        source_sha256=digest,
+        chunking_strategy="recursive",
+        workspace_id="private-workspace",
+        owner_id="private-owner",
+        required_roles=["private-role"],
+    )
+    source_path = tmp_path / "policy.md"
+    source_path.write_bytes(content)
+    ingest_calls = []
+    knowledge_base = workspace_api.service.knowledge_base
+    knowledge_base.list_documents = lambda: [document]
+    knowledge_base.raw_path = lambda source, source_digest: source_path
+    knowledge_base.ingest = lambda *args, **kwargs: ingest_calls.append(args)
+
+    response = workspace_api.client.get(
+        "/v1/admin/operations/reindex-dry-run",
+        headers={"Authorization": "Bearer platform-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "dry_run": True,
+        "read_only": True,
+        "documents": [
+            {
+                "source": "policy.md",
+                "source_sha256": digest,
+                "bytes": len(content),
+                "chunking_strategy": "recursive",
+            }
+        ],
+    }
+    assert "secret document contents" not in response.text
+    assert "private-owner" not in response.text
+    assert "private-role" not in response.text
+    assert ingest_calls == []
+
+
+def test_operations_dry_run_rejects_digest_mismatch(workspace_api, tmp_path):
+    from types import SimpleNamespace
+
+    document = SimpleNamespace(
+        source="policy.md",
+        source_sha256="a" * 64,
+        chunking_strategy="recursive",
+    )
+    source_path = tmp_path / "policy.md"
+    source_path.write_bytes(b"modified document contents")
+    knowledge_base = workspace_api.service.knowledge_base
+    knowledge_base.list_documents = lambda: [document]
+    knowledge_base.raw_path = lambda source, source_digest: source_path
+
+    response = workspace_api.client.get(
+        "/v1/admin/operations/reindex-dry-run",
+        headers={"Authorization": "Bearer platform-token"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "The archived source manifest could not be verified."
+    assert "modified document contents" not in response.text
+
+
+def test_operations_dry_run_reports_missing_manifest(workspace_api):
+    workspace_api.service.knowledge_base.list_documents = lambda: []
+
+    response = workspace_api.client.get(
+        "/v1/admin/operations/reindex-dry-run",
+        headers={"Authorization": "Bearer platform-token"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "The archived source manifest could not be verified."
+
+
+def test_ask_uses_owned_conversation_and_ignores_client_thread_id(tmp_path):
+    from cryptography.fernet import Fernet
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from uuid import UUID
+
+    from rag_pipeline.api import create_app
+    from rag_pipeline.conversations import conversation_thread_id
+    from rag_pipeline.identity_store import WorkspaceStore
+    from rag_pipeline.models import AnswerResponse, VerifiedIdentity
+
+    identities = {
+        "alice-token": VerifiedIdentity(user_id="alice"),
+        "bob-token": VerifiedIdentity(user_id="bob"),
+    }
+
+    class FakeVerifier:
+        def verify(self, token):
+            return identities[token]
+
+    calls = []
+
+    def ask(
+        question,
+        retrieval_mode,
+        thread_id,
+        access_context,
+        api_key,
+        conversation_id=None,
+        checkpoint_variant=None,
+    ):
+        calls.append(
+            (thread_id, access_context, api_key, conversation_id, checkpoint_variant)
+        )
+        return AnswerResponse(
+            question=question,
+            answer="Grounded answer.",
+            retrieval_mode=retrieval_mode,
+            citations=[],
+            retrieved_chunks=[],
+            confidence=0.0,
+            confidence_breakdown={},
+            insufficient_context=False,
+            documents_to_check=[],
+            thread_id=thread_id,
+        )
+
+    class FakeCredentialStore:
+        def __init__(self, *_args):
+            pass
+
+        def get_key(self, *_args):
+            return "test-user-key"
+
+        def close(self):
+            pass
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        api_key=None,
+        database_url=f"sqlite:///{tmp_path / 'ask-conversation.db'}",
+        user_key_encryption_key=Fernet.generate_key().decode("ascii"),
+        oidc_issuer_url="https://identity.example.test/realms/rag",
+        oidc_jwks_url="https://identity.example.test/jwks",
+        qdrant_url=None,
+        openai_api_key=None,
+    )
+    workspace_store = WorkspaceStore(settings.database_url)
+    alice_workspace = workspace_store.create_workspace("Alice workspace")
+    bob_workspace = workspace_store.create_workspace("Bob workspace")
+    workspace_store.add_membership("alice", alice_workspace.id, roles={"employee"})
+    workspace_store.add_membership("bob", bob_workspace.id, roles={"employee"})
+    workspace_store.close()
+    with (
+        patch("rag_pipeline.api.build_oidc_verifier", return_value=FakeVerifier()),
+        patch("rag_pipeline.api.UserCredentialStore", FakeCredentialStore),
+        TestClient(
+            create_app(
+                settings=settings,
+                service=SimpleNamespace(ask=ask),
+            )
+        ) as client,
+    ):
+        alice_headers = {
+            "Authorization": "Bearer alice-token",
+            "X-Workspace-ID": alice_workspace.id,
+        }
+        bob_headers = {
+            "Authorization": "Bearer bob-token",
+            "X-Workspace-ID": bob_workspace.id,
+        }
+        created = client.post(
+            "/v1/conversations",
+            headers=alice_headers,
+            json={"title": "Owned thread"},
+        )
+        conversation_id = created.json()["conversation_id"]
+        response = client.post(
+            "/v1/ask",
+            headers=alice_headers,
+            json={
+                "question": "What happened?",
+                "conversation_id": conversation_id,
+                "thread_id": "attacker-controlled",
+            },
+        )
+        unauthorized = client.post(
+            "/v1/ask",
+            headers=bob_headers,
+            json={
+                "question": "What happened?",
+                "conversation_id": conversation_id,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["conversation_id"] == conversation_id
+    expected_thread_id = conversation_thread_id(
+        calls[0][1],
+        UUID(conversation_id),
+    )
+    assert calls == [
+        (expected_thread_id, calls[0][1], "test-user-key", UUID(conversation_id), None)
+    ]
+    assert calls[0][1].user_id == "alice"
+    assert unauthorized.status_code == 404
+
+
+def test_service_uses_conversation_id_for_scope_isolated_checkpoints(tmp_path):
+    from langgraph.checkpoint.memory import MemorySaver
+    from uuid import uuid4
+
+    from rag_pipeline.models import WorkspaceAccessContext
+    from rag_pipeline.service import RAGService
+
+    settings = replace(
+        Settings.from_env(),
+        data_dir=tmp_path,
+        openai_api_key=None,
+        qdrant_url=None,
+        database_url=None,
+        min_retrieval_confidence=0.0,
+    )
+    checkpointer = MemorySaver()
+    generator = FakeGraphGenerator()
+    service = RAGService(
+        settings,
+        embeddings=FakeEmbeddings(),
+        generator=generator,
+        checkpointer=checkpointer,
+    )
+
+    assert service._checkpointer is checkpointer
+    conversation_id = uuid4()
+    alice = WorkspaceAccessContext(
+        user_id="alice", workspace_id="workspace-a", roles=frozenset({"member"})
+    )
+    bob = alice.model_copy(update={"user_id": "bob"})
+    service.ask(
+        "First question",
+        thread_id="client-thread-a",
+        access_context=alice,
+        conversation_id=conversation_id,
+    )
+    service.close()
+
+    next_generator = FakeGraphGenerator()
+    restarted_service = RAGService(
+        settings,
+        embeddings=FakeEmbeddings(),
+        generator=next_generator,
+        checkpointer=checkpointer,
+    )
+    restarted_service.ask(
+        "Second question",
+        thread_id="client-thread-b",
+        access_context=alice,
+        conversation_id=conversation_id,
+    )
+    assert next_generator.received_history == [
+        "User: First question",
+        "Assistant: The service keeps logs for 30 days [1].",
+    ]
+    restarted_service.ask(
+        "Bob question",
+        thread_id="client-thread-a",
+        access_context=bob,
+        conversation_id=conversation_id,
+    )
+    assert next_generator.received_history == []
+    restarted_service.close()
+
+
+def test_service_does_not_use_memory_saver_for_postgres_by_default(tmp_path):
+    from rag_pipeline.service import RAGService
+
+    settings = replace(
+        Settings.from_env(),
+        data_dir=tmp_path,
+        openai_api_key=None,
+        qdrant_url=None,
+        database_url="postgresql://localhost/rag",
+    )
+    service = RAGService(
+        settings,
+        embeddings=FakeEmbeddings(),
+        generator=FakeGraphGenerator(),
+    )
+
+    assert service._checkpointer is None
+    service.close()
+
+
+def test_conversation_api_scopes_listing_and_deletion_by_user_and_workspace(tmp_path):
+    from cryptography.fernet import Fernet
+    from fastapi.testclient import TestClient
+    from unittest.mock import patch
+
+    from rag_pipeline.api import create_app
+    from rag_pipeline.identity_store import WorkspaceStore
+    from rag_pipeline.models import VerifiedIdentity
+
+    database_url = f"sqlite:///{tmp_path / 'conversation-api.db'}"
+    workspace_store = WorkspaceStore(database_url)
+    shared_workspace = workspace_store.create_workspace("Shared workspace")
+    other_workspace = workspace_store.create_workspace("Other workspace")
+    bob_workspace = workspace_store.create_workspace("Bob workspace")
+    workspace_store.add_membership(
+        "alice", shared_workspace.id, roles={"employee"}
+    )
+    workspace_store.add_membership(
+        "alice", other_workspace.id, roles={"employee"}
+    )
+    workspace_store.add_membership(
+        "bob", bob_workspace.id, roles={"employee"}
+    )
+    workspace_store.close()
+
+    class FakeVerifier:
+        def verify(self, token):
+            return VerifiedIdentity(user_id=token)
+
+    settings = replace(
+        Settings.from_env(),
+        app_env="test",
+        api_key=None,
+        database_url=database_url,
+        user_key_encryption_key=Fernet.generate_key().decode("ascii"),
+        oidc_issuer_url="https://identity.example.test/realms/rag",
+        oidc_jwks_url="https://identity.example.test/jwks",
+        qdrant_url=None,
+    )
+    with (
+        patch("rag_pipeline.api.build_oidc_verifier", return_value=FakeVerifier()),
+        TestClient(create_app(settings=settings)) as client,
+    ):
+        alice_headers = {"Authorization": "Bearer alice"}
+        bob_headers = {"Authorization": "Bearer bob"}
+        alice_headers["X-Workspace-ID"] = shared_workspace.id
+        bob_headers["X-Workspace-ID"] = bob_workspace.id
+        created = client.post(
+            "/v1/conversations",
+            headers=alice_headers,
+            json={"title": "Incident response"},
+        )
+        assert created.status_code == 201
+        conversation_id = created.json()["conversation_id"]
+        alice_list = client.get("/v1/conversations", headers=alice_headers)
+        bob_get = client.get(
+            f"/v1/conversations/{conversation_id}", headers=bob_headers
+        )
+        bob_delete = client.delete(
+            f"/v1/conversations/{conversation_id}", headers=bob_headers
+        )
+        other_workspace_get = client.get(
+            f"/v1/conversations/{conversation_id}",
+            headers={**alice_headers, "X-Workspace-ID": other_workspace.id},
+        )
+        alice_delete = client.delete(
+            f"/v1/conversations/{conversation_id}", headers=alice_headers
+        )
+
+    assert alice_list.status_code == 200
+    assert [item["conversation_id"] for item in alice_list.json()] == [
+        conversation_id
+    ]
+    assert bob_get.status_code == 404
+    assert bob_delete.status_code == 404
+    assert other_workspace_get.status_code == 404
+    assert alice_delete.status_code == 204
 
 
 # Verify dense and sparse retrieval both return persisted chunks for supported query terms.
@@ -1108,6 +2210,40 @@ def test_langgraph_runs_typed_retrieval_and_scoring():
     assert len(next_result.history) == 4
 
 
+def test_langgraph_reads_authorization_scope_from_invocation_config():
+    from rag_pipeline.models import WorkspaceAccessContext
+
+    class CapturingRetriever(FakeGraphRetriever):
+        def __init__(self):
+            super().__init__()
+            self.scopes = []
+
+        def search(self, query, mode, access_context=None):
+            self.scopes.append(access_context)
+            return super().search(query, mode, access_context)
+
+    scope = WorkspaceAccessContext(
+        user_id="alice", workspace_id="workspace-a", roles=frozenset({"member"})
+    )
+    retriever = CapturingRetriever()
+    graph = build_graph(
+        retriever,
+        FakeGraphGenerator(),
+        replace(Settings.from_env(), min_retrieval_confidence=0.0),
+    )
+    graph.invoke(
+        AnswerState(question="What does the policy say?"),
+        config={
+            "configurable": {
+                "thread_id": "scope-config-thread",
+                "access_context": scope.model_dump(mode="json"),
+            }
+        },
+    )
+
+    assert [item.model_dump() for item in retriever.scopes] == [scope.model_dump()]
+
+
 # Verify weak retrieval produces an explicit no-answer and names the closest document.
 def test_langgraph_abstains_when_retrieval_confidence_is_low():
     settings = replace(Settings.from_env(), min_retrieval_confidence=0.4)
@@ -1141,6 +2277,7 @@ def test_production_api_authentication():
         web_base_url="https://app.example.test",
         api_key=None,
         qdrant_url="http://qdrant.example.test:6333",
+        redis_url="redis://redis.example.test:6379/0",
         oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
         openai_api_key="test-openai-key",
         database_url="postgresql+psycopg://user:password@localhost/test",
@@ -1268,6 +2405,7 @@ def test_credential_schema_migration(tmp_path, monkeypatch):
     engine.dispose()
 
     assert "user_openai_keys" in tables
+    assert "conversations" in tables
     assert "alembic_version" in tables
 
 
@@ -1288,6 +2426,83 @@ def test_workspace_membership_repository_supports_multiple_memberships_and_roles
     }
     assert store.get_membership("user-a", shared.id).roles == frozenset({"hr", "employee"})
     assert store.get_membership("user-b", shared.id) is None
+
+
+def test_workspace_creation_creates_named_workspace_and_admin_membership():
+    from rag_pipeline.identity_store import WorkspaceStore
+
+    store = WorkspaceStore("sqlite:///:memory:")
+
+    workspace, membership = store.create_workspace_for_user(
+        "owner-1", "Research", "Internal research library"
+    )
+
+    assert workspace.name == "Research"
+    assert workspace.description == "Internal research library"
+    assert membership.user_id == "owner-1"
+    assert membership.workspace_id == workspace.id
+    assert membership.roles == frozenset({"admin"})
+    assert membership.status == "active"
+    assert store.list_workspace_roles(workspace.id)[0].permissions == frozenset(
+        {"documents:read", "documents:query", "documents:upload", "documents:update"}
+    )
+
+
+def test_workspace_update_changes_name_and_description():
+    from rag_pipeline.identity_store import WorkspaceStore
+
+    store = WorkspaceStore("sqlite:///:memory:")
+    workspace = store.create_workspace("Old name")
+
+    updated = store.update_workspace(workspace.id, "New name", "Updated purpose")
+
+    assert updated is not None
+    assert updated.name == "New name"
+    assert updated.description == "Updated purpose"
+
+
+def test_roles_are_scoped_by_workspace_and_permissions():
+    from rag_pipeline.identity_store import WorkspaceStore
+
+    store = WorkspaceStore("sqlite:///:memory:")
+    first = store.create_workspace("First")
+    second = store.create_workspace("Second")
+    store.create_workspace_role(
+        first.id, "analyst", "Read-only analyst", {"documents:read"}, "owner-a"
+    )
+    store.create_workspace_role(
+        second.id, "analyst", "Uploader analyst", {"documents:upload"}, "owner-b"
+    )
+
+    first_role = next(
+        role for role in store.list_workspace_roles(first.id) if role.name == "analyst"
+    )
+    second_role = next(
+        role for role in store.list_workspace_roles(second.id) if role.name == "analyst"
+    )
+
+    assert first_role.description == "Read-only analyst"
+    assert first_role.permissions == frozenset({"documents:read"})
+    assert second_role.permissions == frozenset({"documents:upload"})
+    assert store.get_role_permissions(first.id, {"analyst"}) == frozenset(
+        {"documents:read"}
+    )
+
+
+def test_workspace_local_role_creation_rejects_unknown_permissions():
+    from rag_pipeline.identity_store import WorkspaceStore
+
+    store = WorkspaceStore("sqlite:///:memory:")
+    workspace = store.create_workspace("Research")
+
+    with pytest.raises(ValueError, match="(?i)unknown permission"):
+        store.create_workspace_role(
+            workspace.id,
+            "analyst",
+            "Invalid permissions",
+            {"documents:read", "users:impersonate"},
+            "owner-1",
+        )
 
 
 def test_personal_workspace_provisioning_is_idempotent():
@@ -1384,6 +2599,119 @@ def test_workspace_membership_schema_migration(tmp_path, monkeypatch):
     assert membership_workspace_id == 512
 
 
+def test_workspace_permission_migration_preserves_existing_data(tmp_path, monkeypatch):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine, inspect, text
+
+    database_path = tmp_path / "workspace-permissions-migration.sqlite"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    config = Config("alembic.ini")
+    command.upgrade(config, "0006_conversations")
+
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, personal_owner_id) "
+                "VALUES ('legacy-workspace', 'Legacy workspace', 'legacy-owner')"
+            )
+        )
+        connection.execute(
+            text("INSERT INTO role_definitions (name) VALUES ('analyst')")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO workspace_memberships "
+                "(user_id, workspace_id, roles, status) "
+                "VALUES ('member-1', 'legacy-workspace', :roles, 'active')"
+            ),
+            {"roles": json.dumps(["hr", "analyst"])},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO workspace_invitations "
+                "(id, workspace_id, email, token_hash, roles, expires_at, created_by) "
+                "VALUES ('invite-1', 'legacy-workspace', 'invitee@example.test', "
+                "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', "
+                ":roles, :expires_at, 'legacy-owner')"
+            ),
+            {
+                "roles": json.dumps(["analyst"]),
+                "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO document_chunk_catalog "
+                "(chunk_id, chunk_text, source, source_sha256, chunk_index, "
+                "chunking_strategy, character_count, workspace_id, owner_id, required_roles) "
+                "VALUES ('chunk-1', 'legacy data', 'guide.txt', :digest, 0, 'recursive', "
+                "11, 'legacy-workspace', 'legacy-owner', :roles)"
+            ),
+            {
+                "digest": "b" * 64,
+                "roles": json.dumps(["hr"]),
+            },
+        )
+    engine.dispose()
+
+    command.upgrade(config, "head")
+
+    from rag_pipeline.identity_store import WorkspaceStore
+
+    store = WorkspaceStore(database_url)
+    migrated_workspace = store.get_workspace("legacy-workspace")
+    roles = {
+        role.name: role
+        for role in store.list_workspace_roles("legacy-workspace")
+    }
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        membership_roles = json.loads(
+            connection.scalar(
+                text(
+                    "SELECT roles FROM workspace_memberships "
+                    "WHERE user_id = 'member-1' AND workspace_id = 'legacy-workspace'"
+                )
+            )
+        )
+        invitation_roles = json.loads(
+            connection.scalar(
+                text("SELECT roles FROM workspace_invitations WHERE id = 'invite-1'")
+            )
+        )
+        document_roles = json.loads(
+            connection.scalar(
+                text("SELECT required_roles FROM document_chunk_catalog WHERE chunk_id = 'chunk-1'")
+            )
+        )
+        tables = set(inspect(connection).get_table_names())
+    engine.dispose()
+
+    assert migrated_workspace is not None
+    assert migrated_workspace.name == "Legacy workspace"
+    assert migrated_workspace.description == ""
+    assert membership_roles == ["hr", "analyst"]
+    assert invitation_roles == ["analyst"]
+    assert document_roles == ["hr"]
+    assert {"admin", "ceo", "employee", "hr", "analyst"} <= set(roles)
+    assert roles["admin"].permissions == frozenset(
+        {"documents:read", "documents:query", "documents:upload", "documents:update"}
+    )
+    assert roles["hr"].permissions == frozenset(
+        {"documents:read", "documents:query", "documents:upload"}
+    )
+    assert roles["analyst"].permissions == frozenset(
+        {"documents:read", "documents:query", "documents:upload"}
+    )
+    assert "workspace_roles" in tables
+
+
 def test_workspace_scope_uses_current_membership_not_token_claims(tmp_path):
     from cryptography.fernet import Fernet
     from fastapi.testclient import TestClient
@@ -1431,7 +2759,7 @@ def test_workspace_scope_uses_current_membership_not_token_claims(tmp_path):
     preflight = client.options(
         "/v1/account/openai-key",
         headers={
-            "Origin": "http://localhost:8501",
+            "Origin": "http://localhost:5173",
             "Access-Control-Request-Method": "PUT",
             "Access-Control-Request-Headers": "authorization,content-type,x-workspace-id",
         },
@@ -1441,6 +2769,7 @@ def test_workspace_scope_uses_current_membership_not_token_claims(tmp_path):
 
     assert personal.workspace_id == "personal:alice"
     alice = {"Authorization": "Bearer alice-token"}
+    alice["X-Workspace-ID"] = personal.workspace_id
     assert client.get("/v1/documents", headers=alice).status_code == 200
     assert seen_contexts[-1].workspace_id == personal.workspace_id
     assert seen_contexts[-1].roles == frozenset({"admin"})
@@ -1504,6 +2833,7 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
     from unittest.mock import patch
 
     from rag_pipeline.api import create_app
+    from rag_pipeline.conversations import ConversationStore
     from rag_pipeline.credentials import UserCredentialStore
     from rag_pipeline.identity_store import WorkspaceStore
     from rag_pipeline.models import AnswerResponse, VerifiedIdentity
@@ -1530,6 +2860,8 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
         thread_id: str,
         _access_context,
         api_key: str,
+        conversation_id=None,
+        checkpoint_variant=None,
     ) -> AnswerResponse:
         used_keys.append(api_key)
         return AnswerResponse(
@@ -1551,22 +2883,38 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
         web_base_url="https://app.example.test",
         api_key=None,
         qdrant_url="http://qdrant.example.test:6333",
+        redis_url="redis://redis.example.test:6379/0",
         oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
         openai_api_key=None,
         database_url="postgresql+psycopg://user:password@localhost/test",
         user_key_encryption_key=encryption_key,
     )
     fake_service = SimpleNamespace(ask=ask)
+
     with (
         patch("rag_pipeline.api.build_oidc_verifier", return_value=StaticVerifier()),
         patch("rag_pipeline.api.UserCredentialStore", return_value=store),
         patch("rag_pipeline.api.WorkspaceStore", return_value=workspace_store),
+        patch(
+            "rag_pipeline.api.ConversationStore",
+            return_value=ConversationStore("sqlite:///:memory:"),
+        ),
     ):
-        client = TestClient(create_app(settings=settings, service=fake_service))
+        app = create_app(settings=settings, service=fake_service)
+        app.state.rate_limiter = SimpleNamespace(allow=lambda *_args: True)
+        client = TestClient(app)
 
-    alice_headers = {"Authorization": "Bearer alice-token"}
-    bob_headers = {"Authorization": "Bearer bob-token"}
+    alice_headers = {
+        "Authorization": "Bearer alice-token",
+        "X-Workspace-ID": "personal:alice",
+    }
+    bob_headers = {
+        "Authorization": "Bearer bob-token",
+        "X-Workspace-ID": "personal:bob",
+    }
     alice_key = "sk-alice-specific-test-key"
+    alice_headers["X-Workspace-ID"] = "personal:alice"
+    bob_headers["X-Workspace-ID"] = "personal:bob"
     saved = client.put(
         "/v1/account/openai-key",
         headers=alice_headers,
@@ -1653,6 +3001,7 @@ def test_platform_admin_cross_workspace_requests_are_audited(workspace_api):
     from sqlalchemy import create_engine, inspect, text
 
     client = workspace_api.client
+    client.headers.update({"X-Workspace-ID": "personal:platform"})
     headers = {
         "Authorization": "Bearer platform-token",
         "X-Workspace-ID": workspace_api.shared_workspace_id,
@@ -1685,9 +3034,12 @@ def test_platform_admin_cross_workspace_requests_are_audited(workspace_api):
                 "X-Workspace-ID": "personal:platform",
             },
         ),
-        client.get("/v1/roles", headers=headers),
+        client.get(
+            f"/v1/workspaces/{workspace_api.shared_workspace_id}/roles",
+            headers=headers,
+        ),
         client.post(
-            "/v1/roles",
+            f"/v1/workspaces/{workspace_api.shared_workspace_id}/roles",
             headers=headers,
             json={"name": "auditor"},
         ),
@@ -1696,7 +3048,7 @@ def test_platform_admin_cross_workspace_requests_are_audited(workspace_api):
             headers={"Authorization": "Bearer platform-token"},
         ),
         client.get(
-            "/v1/roles",
+            f"/v1/workspaces/{workspace_api.owner_workspace_id}/roles",
             headers={"Authorization": "Bearer platform-token"},
         ),
     ]
@@ -1733,7 +3085,11 @@ def test_platform_admin_cross_workspace_requests_are_audited(workspace_api):
     assert {row.workspace_id for row in rows[:6]} == {
         workspace_api.shared_workspace_id
     }
-    assert all(row.workspace_id is None for row in rows[6:])
+    assert {row.workspace_id for row in rows[6:8]} == {
+        workspace_api.shared_workspace_id
+    }
+    assert rows[8].workspace_id is None
+    assert rows[9].workspace_id == workspace_api.owner_workspace_id
     assert {row.request_id for row in rows} == set(request_ids)
     assert {row.action for row in rows} == {
         "GET /v1/documents",
@@ -1741,8 +3097,8 @@ def test_platform_admin_cross_workspace_requests_are_audited(workspace_api):
         "POST /v1/ask",
         "POST /v1/compare",
         "GET /v1/workspaces/{workspace_id}/members",
-        "GET /v1/roles",
-        "POST /v1/roles",
+        "GET /v1/workspaces/{workspace_id}/roles",
+        "POST /v1/workspaces/{workspace_id}/roles",
         "GET /v1/workspaces",
     }
     assert all(
@@ -1786,6 +3142,7 @@ def workspace_api(tmp_path):
     employee_personal = store.create_personal_workspace("employee")
     store.add_membership("employee", owner_personal.workspace_id, roles={"employee"})
     other_personal = store.create_personal_workspace("other")
+    store.create_personal_workspace("platform")
     identities = {
         "owner-token": VerifiedIdentity(
             user_id="owner", email="owner@example.test", email_verified=True
@@ -1836,25 +3193,26 @@ def workspace_api(tmp_path):
         database_url=database_url,
         user_key_encryption_key=Fernet.generate_key().decode("ascii"),
     )
+    service = SimpleNamespace(
+        knowledge_base=SimpleNamespace(
+            list_documents=lambda *_args: [],
+            get_document=lambda *_args: None,
+        )
+    )
     with (
         patch("rag_pipeline.api.build_oidc_verifier", return_value=StaticVerifier()),
         patch("rag_pipeline.api.WorkspaceStore", return_value=store),
         patch("rag_pipeline.workspaces.SMTPInvitationMailer", FakeMailer),
         TestClient(
-            create_app(
-                settings=settings,
-                service=SimpleNamespace(
-                    knowledge_base=SimpleNamespace(
-                        list_documents=lambda _access_context: []
-                    )
-                ),
-            )
+            create_app(settings=settings, service=service)
         ) as client,
     ):
         yield SimpleNamespace(
             client=client,
+            service=service,
             store=store,
             database_url=database_url,
+            settings=settings,
             sent_messages=sent_messages,
             owner_workspace_id=owner_personal.workspace_id,
             shared_workspace_id=shared.id,
@@ -1863,8 +3221,340 @@ def workspace_api(tmp_path):
         )
 
 
+def _create_test_workspace_role(workspace_api, workspace_id, name, permissions):
+    workspace_api.store.create_role(name, "owner")
+    return workspace_api.store.create_workspace_role(
+        workspace_id,
+        name,
+        f"{name} role",
+        permissions,
+        "owner",
+    )
+
+
+def test_workspace_admin_creates_workspace_role_permissions(workspace_api):
+    client = workspace_api.client
+    workspace_id = workspace_api.shared_workspace_id
+    headers = {
+        "Authorization": "Bearer owner-token",
+        "X-Workspace-ID": workspace_id,
+    }
+
+    created = client.post(
+        f"/v1/workspaces/{workspace_id}/roles",
+        headers=headers,
+        json={
+            "name": "analyst",
+            "description": "Read-only research access",
+            "permissions": ["documents:read", "documents:query"],
+        },
+    )
+    listed = client.get(f"/v1/workspaces/{workspace_id}/roles", headers=headers)
+
+    assert created.status_code == 201
+    assert created.json()["name"] == "analyst"
+    assert created.json()["description"] == "Read-only research access"
+    assert created.json()["permissions"] == ["documents:query", "documents:read"]
+    assert {role["name"] for role in listed.json()} >= {"admin", "analyst", "employee"}
+    assert workspace_api.store.get_role_permissions(
+        workspace_id, {"analyst"}
+    ) == frozenset({"documents:read", "documents:query"})
+
+
+def test_non_admin_cannot_create_roles_or_invite(workspace_api):
+    client = workspace_api.client
+    workspace_id = workspace_api.shared_workspace_id
+    workspace_api.store.add_membership("employee", workspace_id, roles={"hr"})
+    headers = {
+        "Authorization": "Bearer employee-token",
+        "X-Workspace-ID": workspace_id,
+    }
+
+    role_response = client.post(
+        f"/v1/workspaces/{workspace_id}/roles",
+        headers=headers,
+        json={
+            "name": "restricted",
+            "description": "",
+            "permissions": ["documents:read"],
+        },
+    )
+    invitation_response = client.post(
+        f"/v1/workspaces/{workspace_id}/invitations",
+        headers=headers,
+        json={"email": "new-member@example.test", "roles": ["hr"]},
+    )
+
+    assert role_response.status_code == 403
+    assert invitation_response.status_code == 403
+    assert workspace_api.sent_messages == []
+
+
+def test_documents_read_and_query_require_capabilities(workspace_api):
+    client = workspace_api.client
+    workspace_id = workspace_api.shared_workspace_id
+    _create_test_workspace_role(
+        workspace_api, workspace_id, "reader", {"documents:read"}
+    )
+    _create_test_workspace_role(
+        workspace_api, workspace_id, "queryer", {"documents:query"}
+    )
+    workspace_api.store.add_membership("employee", workspace_id, roles={"reader"})
+    workspace_api.store.add_membership("invitee", workspace_id, roles={"queryer"})
+
+    reader_headers = {
+        "Authorization": "Bearer employee-token",
+        "X-Workspace-ID": workspace_id,
+    }
+    queryer_headers = {
+        "Authorization": "Bearer invitee-token",
+        "X-Workspace-ID": workspace_id,
+    }
+
+    assert client.get("/v1/documents", headers=reader_headers).status_code == 200
+    assert client.post(
+        "/v1/ask",
+        headers=reader_headers,
+        json={"question": "What is in the workspace?"},
+    ).status_code == 403
+    assert client.post(
+        "/v1/compare",
+        headers=reader_headers,
+        json={"question": "Compare the workspace sources."},
+    ).status_code == 403
+    assert client.get("/v1/documents", headers=queryer_headers).status_code == 403
+
+
+def test_ingest_requires_upload_and_replacement_requires_update(workspace_api, monkeypatch):
+    from types import SimpleNamespace
+
+    client = workspace_api.client
+    workspace_id = workspace_api.shared_workspace_id
+    _create_test_workspace_role(
+        workspace_api, workspace_id, "reader", {"documents:read"}
+    )
+    _create_test_workspace_role(
+        workspace_api, workspace_id, "uploader", {"documents:upload"}
+    )
+    workspace_api.store.add_membership("employee", workspace_id, roles={"reader"})
+    workspace_api.store.add_membership("invitee", workspace_id, roles={"uploader"})
+    workspace_api.service.knowledge_base.get_document = lambda *_args: SimpleNamespace(
+        source="existing.txt",
+        source_sha256="a" * 64,
+        bytes=10,
+        chunk_count=1,
+        chunking_strategy="recursive",
+        ingested_at="2026-01-01T00:00:00+00:00",
+        workspace_id=workspace_id,
+        owner_id="owner",
+        required_roles=["uploader"],
+    )
+    workspace_api.service.knowledge_base.ingest = lambda *_args: pytest.fail(
+        "Denied uploads must not write indexed data."
+    )
+    embedding_calls = []
+    monkeypatch.setattr(
+        "rag_pipeline.api.OpenAIEmbeddingProvider",
+        lambda *_args, **_kwargs: embedding_calls.append(True),
+    )
+
+    read_only_response = client.post(
+        "/v1/ingest",
+        headers={
+            "Authorization": "Bearer employee-token",
+            "X-Workspace-ID": workspace_id,
+        },
+        files={"file": ("new.txt", b"New policy text")},
+        data={"roles": "reader"},
+    )
+    upload_only_response = client.post(
+        "/v1/ingest",
+        headers={
+            "Authorization": "Bearer invitee-token",
+            "X-Workspace-ID": workspace_id,
+        },
+        files={"file": ("existing.txt", b"Replacement policy text")},
+        data={"roles": "uploader"},
+    )
+
+    assert read_only_response.status_code == 403
+    assert upload_only_response.status_code == 403
+    assert embedding_calls == []
+
+
+def test_ingest_accepts_multiple_workspace_roles(workspace_api, monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from rag_pipeline.credentials import UserCredentialStore
+    from rag_pipeline.models import DocumentInfo, IngestionResult
+
+    workspace_id = workspace_api.shared_workspace_id
+    workspace_api.store.add_membership(
+        "employee", workspace_id, roles={"employee", "hr"}
+    )
+    credentials = UserCredentialStore(
+        workspace_api.database_url,
+        workspace_api.settings.user_key_encryption_key,
+    )
+    credentials.set_key("employee", workspace_id, "test-openai-key")
+    ingest_calls = []
+
+    def ingest(filename, content, strategy, context, required_roles, _embeddings):
+        ingest_calls.append((filename, content, strategy, context, required_roles))
+        return IngestionResult(
+            document=DocumentInfo(
+                source=filename,
+                source_sha256="a" * 64,
+                bytes=len(content),
+                chunk_count=1,
+                chunking_strategy=strategy,
+                ingested_at=datetime.now(timezone.utc).isoformat(),
+                workspace_id=context.workspace_id,
+                owner_id=context.user_id,
+                required_roles=required_roles,
+            ),
+            inserted_chunks=1,
+            duplicate_chunks_skipped=0,
+        )
+
+    workspace_api.service.knowledge_base.get_document = lambda *_args: None
+    workspace_api.service.knowledge_base.ingest = ingest
+    monkeypatch.setattr(
+        "rag_pipeline.api.OpenAIEmbeddingProvider",
+        lambda *_args, **_kwargs: object(),
+    )
+    response = workspace_api.client.post(
+        "/v1/ingest",
+        headers={
+            "Authorization": "Bearer employee-token",
+            "X-Workspace-ID": workspace_id,
+        },
+        files={"file": ("policy.txt", b"Policy text")},
+        data={"roles": "hr,employee"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["document"]["required_roles"] == ["employee", "hr"]
+    assert ingest_calls[0][4] == ["employee", "hr"]
+    assert ingest_calls[0][3].permissions == frozenset(
+        {"documents:read", "documents:query", "documents:upload"}
+    )
+
+
+def test_ingest_rejects_role_from_another_workspace_before_embedding(
+    workspace_api, monkeypatch
+):
+    from sqlalchemy.orm import Session
+
+    from rag_pipeline.identity_store import WorkspaceMembership
+
+    workspace_id = workspace_api.shared_workspace_id
+    other_workspace = workspace_api.store.create_workspace("Other department")
+    workspace_api.store.create_workspace_role(
+        other_workspace.id,
+        "foreign",
+        "Role from another workspace",
+        {"documents:upload"},
+        "owner",
+    )
+    workspace_api.store.add_membership(
+        "employee", workspace_id, roles={"employee"}
+    )
+    with Session(workspace_api.store._engine) as session, session.begin():
+        membership = session.get(WorkspaceMembership, ("employee", workspace_id))
+        membership.roles = ["foreign"]
+    embedding_calls = []
+    monkeypatch.setattr(
+        "rag_pipeline.api.OpenAIEmbeddingProvider",
+        lambda *_args, **_kwargs: embedding_calls.append(True),
+    )
+
+    response = workspace_api.client.post(
+        "/v1/ingest",
+        headers={
+            "Authorization": "Bearer employee-token",
+            "X-Workspace-ID": workspace_id,
+        },
+        files={"file": ("policy.txt", b"Policy text")},
+        data={"roles": "foreign"},
+    )
+
+    assert response.status_code == 403
+    assert embedding_calls == []
+
+
+def test_role_permission_union_and_acl_intersection_are_enforced(
+    workspace_api, tmp_path
+):
+    from types import SimpleNamespace
+
+    from rag_pipeline.models import AccessContext
+    from rag_pipeline.storage import KnowledgeBase
+
+    workspace_id = workspace_api.shared_workspace_id
+    _create_test_workspace_role(
+        workspace_api, workspace_id, "reader", {"documents:read"}
+    )
+    _create_test_workspace_role(
+        workspace_api, workspace_id, "queryer", {"documents:query"}
+    )
+    workspace_api.store.add_membership(
+        "employee", workspace_id, roles={"reader", "queryer"}
+    )
+    settings = replace(
+        Settings.from_env(),
+        data_dir=tmp_path,
+        reranker_enabled=False,
+        chunk_size=1000,
+        chunk_overlap=0,
+    )
+    knowledge_base = KnowledgeBase(settings, FakeEmbeddings())
+    document_owner = AccessContext(
+        user_id="document-owner",
+        workspace_id=workspace_id,
+        roles=frozenset({"admin"}),
+    )
+    knowledge_base.ingest(
+        "reader.txt",
+        b"Reader-only evidence.",
+        "recursive",
+        document_owner,
+        ["reader"],
+    )
+    knowledge_base.ingest(
+        "hr.txt",
+        b"Human-resources-only evidence.",
+        "recursive",
+        document_owner,
+        ["hr"],
+    )
+    observed_contexts = []
+    workspace_api.service.knowledge_base = SimpleNamespace(
+        list_documents=lambda context: (
+            observed_contexts.append(context) or knowledge_base.list_documents(context)
+        )
+    )
+
+    response = workspace_api.client.get(
+        "/v1/documents",
+        headers={
+            "Authorization": "Bearer employee-token",
+            "X-Workspace-ID": workspace_id,
+        },
+    )
+
+    assert response.status_code == 200
+    assert [document["source"] for document in response.json()] == ["reader.txt"]
+    assert observed_contexts[0].roles == frozenset({"reader", "queryer"})
+    assert observed_contexts[0].permissions == frozenset(
+        {"documents:read", "documents:query"}
+    )
+
+
 def test_workspace_member_management_is_scoped_and_uses_existing_roles(workspace_api):
     client = workspace_api.client
+    client.headers.update({"X-Workspace-ID": workspace_api.owner_workspace_id})
     owner_headers = {"Authorization": "Bearer owner-token"}
     employee_headers = {"Authorization": "Bearer employee-token"}
     workspace_id = workspace_api.owner_workspace_id
@@ -1936,29 +3626,212 @@ def test_workspace_member_management_is_scoped_and_uses_existing_roles(workspace
     ).status_code == 403
 
 
-def test_workspace_roles_are_visible_to_members_but_only_platform_admin_can_define(
+def test_workspace_list_does_not_provision_workspace(workspace_api):
+    client = workspace_api.client
+    headers = {"Authorization": "Bearer invitee-token"}
+
+    listed = client.get("/v1/workspaces", headers=headers)
+    documents = client.get("/v1/documents", headers=headers)
+
+    assert listed.status_code == 200
+    assert listed.json() == []
+    assert workspace_api.store.list_memberships("invitee") == []
+    assert documents.status_code == 400
+    assert workspace_api.store.list_memberships("invitee") == []
+
+
+def test_workspace_creation_requires_identity_and_creates_admin(workspace_api):
+    client = workspace_api.client
+    body = {"name": "Product research", "description": "Shared product evidence"}
+
+    assert client.post("/v1/workspaces", json=body).status_code == 401
+    created = client.post(
+        "/v1/workspaces",
+        headers={"Authorization": "Bearer invitee-token"},
+        json=body,
+    )
+
+    assert created.status_code == 201
+    assert created.json()["name"] == "Product research"
+    assert created.json()["description"] == "Shared product evidence"
+    assert created.json()["roles"] == ["admin"]
+    assert created.json()["status"] == "active"
+    membership = workspace_api.store.get_membership(
+        "invitee", created.json()["id"]
+    )
+    assert membership is not None
+    assert membership.roles == frozenset({"admin"})
+
+
+def test_workspace_update_requires_admin(workspace_api):
+    client = workspace_api.client
+    workspace_id = workspace_api.shared_workspace_id
+    client.headers.update({"X-Workspace-ID": workspace_id})
+    body = {"name": "Operations renamed", "description": "Updated description"}
+
+    denied = client.patch(
+        f"/v1/workspaces/{workspace_id}",
+        headers={"Authorization": "Bearer employee-token"},
+        json=body,
+    )
+    updated = client.patch(
+        f"/v1/workspaces/{workspace_id}",
+        headers={"Authorization": "Bearer owner-token"},
+        json=body,
+    )
+
+    assert denied.status_code == 403
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "Operations renamed"
+    assert updated.json()["description"] == "Updated description"
+
+
+def test_invitation_acceptance_works_without_workspace_header(workspace_api):
+    from datetime import datetime, timedelta, timezone
+    from hashlib import sha256
+
+    token = "invitation-token-without-workspace-header"
+    invitation = workspace_api.store.create_invitation(
+        workspace_id=workspace_api.shared_workspace_id,
+        email="invitee@example.test",
+        roles={"hr"},
+        token_hash=sha256(token.encode("utf-8")).hexdigest(),
+        created_by="owner",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    response = workspace_api.client.post(
+        "/v1/invitations/accept",
+        headers={"Authorization": "Bearer invitee-token"},
+        json={"token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["workspace_id"] == invitation.workspace_id
+    assert response.json()["roles"] == ["hr"]
+    assert workspace_api.store.get_membership(
+        "invitee", invitation.workspace_id
+    ).roles == frozenset({"hr"})
+
+
+def test_invitation_acceptance_adds_roles_and_reactivates_membership(workspace_api):
+    from datetime import datetime, timedelta, timezone
+    from hashlib import sha256
+
+    workspace_id = workspace_api.shared_workspace_id
+    workspace_api.store.add_membership(
+        "invitee", workspace_id, roles={"employee"}, status="suspended"
+    )
+    token = "invitation-token-reactivates-member"
+    workspace_api.store.create_invitation(
+        workspace_id=workspace_id,
+        email="invitee@example.test",
+        roles={"hr"},
+        token_hash=sha256(token.encode("utf-8")).hexdigest(),
+        created_by="owner",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+    response = workspace_api.client.post(
+        "/v1/invitations/accept",
+        headers={"Authorization": "Bearer invitee-token"},
+        json={"token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["roles"] == ["employee", "hr"]
+    assert response.json()["status"] == "active"
+
+
+def test_first_time_invitee_gets_custom_workspace_permissions(workspace_api):
+    from urllib.parse import parse_qs, urlparse
+
+    client = workspace_api.client
+    owner_headers = {"Authorization": "Bearer owner-token"}
+    invitee_headers = {"Authorization": "Bearer invitee-token"}
+
+    assert client.get("/v1/workspaces", headers=invitee_headers).json() == []
+    created = client.post(
+        "/v1/workspaces",
+        headers=owner_headers,
+        json={
+            "name": "People Operations",
+            "description": "Private people policies",
+        },
+    )
+    assert created.status_code == 201
+    workspace_id = created.json()["id"]
+
+    role = client.post(
+        f"/v1/workspaces/{workspace_id}/roles",
+        headers={**owner_headers, "X-Workspace-ID": workspace_id},
+        json={
+            "name": "hr-analyst",
+            "description": "People team document access",
+            "permissions": ["documents:read", "documents:query"],
+        },
+    )
+    assert role.status_code == 201
+
+    invitation = client.post(
+        f"/v1/workspaces/{workspace_id}/invitations",
+        headers={**owner_headers, "X-Workspace-ID": workspace_id},
+        json={"email": "invitee@example.test", "roles": ["hr-analyst"]},
+    )
+    assert invitation.status_code == 201
+    token = parse_qs(urlparse(workspace_api.sent_messages[-1][1]).fragment)["token"][0]
+
+    accepted = client.post(
+        "/v1/invitations/accept",
+        headers=invitee_headers,
+        json={"token": token},
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["workspace_id"] == workspace_id
+    assert accepted.json()["roles"] == ["hr-analyst"]
+    invitee_workspaces = client.get(
+        "/v1/workspaces",
+        headers=invitee_headers,
+    )
+    assert invitee_workspaces.status_code == 200
+    assert invitee_workspaces.json() == [
+        {
+            "id": workspace_id,
+            "name": "People Operations",
+            "description": "Private people policies",
+            "roles": ["hr-analyst"],
+            "permissions": ["documents:query", "documents:read"],
+            "status": "active",
+            "is_personal": False,
+        }
+    ]
+
+
+def test_workspace_roles_are_scoped_and_workspace_admin_can_define(
     workspace_api,
 ):
     client = workspace_api.client
+    client.headers.update({"X-Workspace-ID": workspace_api.owner_workspace_id})
 
-    roles = client.get("/v1/roles", headers={"Authorization": "Bearer owner-token"})
+    roles = client.get(f"/v1/workspaces/{workspace_api.owner_workspace_id}/roles", headers={"Authorization": "Bearer owner-token"})
     assert roles.status_code == 200
     assert {"admin", "ceo", "employee", "hr"} <= {role["name"] for role in roles.json()}
 
     body = {"name": "analyst"}
     assert client.post(
-        "/v1/roles", headers={"Authorization": "Bearer owner-token"}, json=body
-    ).status_code == 403
-    assert client.post(
-        "/v1/roles", headers={"Authorization": "Bearer platform-token"}, json=body
+        f"/v1/workspaces/{workspace_api.owner_workspace_id}/roles", headers={"Authorization": "Bearer owner-token"}, json=body
     ).status_code == 201
     assert client.post(
-        "/v1/roles",
+        f"/v1/workspaces/{workspace_api.owner_workspace_id}/roles", headers={"Authorization": "Bearer platform-token"}, json={"name": "platform-analyst"}
+    ).status_code == 201
+    assert client.post(
+        f"/v1/workspaces/{workspace_api.owner_workspace_id}/roles",
         headers={"Authorization": "Bearer platform-token"},
         json={"name": "invalid role"},
     ).status_code == 422
     assert client.get(
-        "/v1/roles", headers={"Authorization": "Bearer employee-token"}
+        f"/v1/workspaces/{workspace_api.owner_workspace_id}/roles", headers={"Authorization": "Bearer employee-token"}
     ).status_code == 200
 
     all_workspaces = client.get(
@@ -1975,6 +3848,7 @@ def test_workspace_invitation_is_hashed_single_use_and_email_bound(workspace_api
     from sqlalchemy import create_engine, text
 
     client = workspace_api.client
+    client.headers.update({"X-Workspace-ID": workspace_api.owner_workspace_id})
     headers = {"Authorization": "Bearer owner-token"}
     response = client.post(
         f"/v1/workspaces/{workspace_api.owner_workspace_id}/invitations",
@@ -1985,7 +3859,9 @@ def test_workspace_invitation_is_hashed_single_use_and_email_bound(workspace_api
     assert "token" not in response.json()
     email, invite_url = workspace_api.sent_messages[-1]
     assert email == "invitee@example.test"
-    token = parse_qs(urlparse(invite_url).query)["token"][0]
+    parsed_invite_url = urlparse(invite_url)
+    assert not parsed_invite_url.query
+    token = parse_qs(parsed_invite_url.fragment)["token"][0]
 
     engine = create_engine(workspace_api.database_url)
     with engine.connect() as connection:
@@ -1998,19 +3874,22 @@ def test_workspace_invitation_is_hashed_single_use_and_email_bound(workspace_api
     assert token not in token_hash
 
     mismatched_email = client.post(
-        f"/v1/invitations/{token}/accept",
+        "/v1/invitations/accept",
+        json={"token": token},
         headers={"Authorization": "Bearer wrong-email-token"},
     )
     assert mismatched_email.status_code == 403
     client.headers.update({"X-Workspace-ID": workspace_api.owner_workspace_id})
     accepted = client.post(
-        f"/v1/invitations/{token}/accept",
+        "/v1/invitations/accept",
+        json={"token": token},
         headers={"Authorization": "Bearer invitee-token"},
     )
     assert accepted.status_code == 200
     assert accepted.json()["roles"] == ["employee"]
     assert client.post(
-        f"/v1/invitations/{token}/accept",
+        "/v1/invitations/accept",
+        json={"token": token},
         headers={"Authorization": "Bearer invitee-token"},
     ).status_code == 409
 
@@ -2022,6 +3901,7 @@ def test_workspace_invitation_rejects_expired_or_unverified_email(workspace_api)
     from sqlalchemy import create_engine, text
 
     client = workspace_api.client
+    client.headers.update({"X-Workspace-ID": workspace_api.owner_workspace_id})
     headers = {"Authorization": "Bearer owner-token"}
     invitation = client.post(
         f"/v1/workspaces/{workspace_api.owner_workspace_id}/invitations",
@@ -2029,15 +3909,17 @@ def test_workspace_invitation_rejects_expired_or_unverified_email(workspace_api)
         json={"email": "invitee@example.test", "roles": ["employee"]},
     )
     assert invitation.status_code == 201
-    token = parse_qs(urlparse(workspace_api.sent_messages[-1][1]).query)["token"][0]
+    token = parse_qs(urlparse(workspace_api.sent_messages[-1][1]).fragment)["token"][0]
     assert invitation.status_code == 201
 
     assert client.post(
-        f"/v1/invitations/{token}/accept",
+        "/v1/invitations/accept",
+        json={"token": token},
         headers={"Authorization": "Bearer wrong-email-token"},
     ).status_code == 403
     assert client.post(
-        f"/v1/invitations/{token}/accept",
+        "/v1/invitations/accept",
+        json={"token": token},
         headers={"Authorization": "Bearer unverified-email-token"},
     ).status_code == 403
 
@@ -2047,7 +3929,7 @@ def test_workspace_invitation_rejects_expired_or_unverified_email(workspace_api)
         json={"email": "invitee@example.test", "roles": ["employee"]},
     )
     assert expired.status_code == 201
-    expired_token = parse_qs(urlparse(workspace_api.sent_messages[-1][1]).query)["token"][0]
+    expired_token = parse_qs(urlparse(workspace_api.sent_messages[-1][1]).fragment)["token"][0]
     engine = create_engine(workspace_api.database_url)
     with engine.begin() as connection:
         connection.execute(
@@ -2063,7 +3945,8 @@ def test_workspace_invitation_rejects_expired_or_unverified_email(workspace_api)
         )
     engine.dispose()
     assert client.post(
-        f"/v1/invitations/{expired_token}/accept",
+        "/v1/invitations/accept",
+        json={"token": expired_token},
         headers={"Authorization": "Bearer invitee-token"},
     ).status_code == 410
 
@@ -2071,7 +3954,9 @@ def test_workspace_invitation_rejects_expired_or_unverified_email(workspace_api)
 def test_workspace_invitation_reports_smtp_failure_without_leaking_token(workspace_api):
     from sqlalchemy import create_engine, text
 
-    response = workspace_api.client.post(
+    client = workspace_api.client
+    client.headers.update({"X-Workspace-ID": workspace_api.owner_workspace_id})
+    response = client.post(
         f"/v1/workspaces/{workspace_api.owner_workspace_id}/invitations",
         headers={"Authorization": "Bearer owner-token"},
         json={"email": "smtp-failure@example.test", "roles": ["employee"]},

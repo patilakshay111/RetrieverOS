@@ -2,12 +2,18 @@
 
 from typing import Protocol
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 from rag_pipeline.config import Settings
 from rag_pipeline.generation import insufficient_context_answer
-from rag_pipeline.models import AccessContext, AnswerState, CitationCheck, RetrievedChunk
+from rag_pipeline.models import (
+    AccessContext,
+    AnswerState,
+    CitationCheck,
+    RetrievedChunk,
+)
 
 
 class Retriever(Protocol):
@@ -33,7 +39,7 @@ class Generator(Protocol):
     def assess_completeness(self, question: str, answer: str) -> tuple[float, str]: ...
 
 
-# Compile a retrieve-generate-verify-score graph with in-memory conversation checkpoints.
+# Compile the workflow with an injected saver or the local in-memory default.
 def build_graph(
     retriever: Retriever,
     generator: Generator,
@@ -42,10 +48,17 @@ def build_graph(
     checkpointer=None,
 ):
     # Retrieve only the chunks relevant to the current question.
-    def retrieve(state: AnswerState) -> dict:
+    def retrieve(state: AnswerState, config: RunnableConfig) -> dict:
         retrieval_query = "\n".join([*state.history[-6:], f"Current question: {state.question}"])
+        configurable = config.get("configurable") or {}
+        configured_scope = configurable.get("access_context")
+        access_context = (
+            state.access_context
+            if configured_scope is None
+            else AccessContext.model_validate(configured_scope)
+        )
         chunks, confidence = retriever.search(
-            retrieval_query, state.retrieval_mode, state.access_context
+            retrieval_query, state.retrieval_mode, access_context
         )
         return {
             "retrieved_chunks": chunks,

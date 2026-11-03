@@ -253,7 +253,8 @@ class LexicalStore:
             token_params: list[str] = []
             for index, token in enumerate(query_tokens):
                 key = f"token_{index}"
-                params[key] = f"%{token.replace('%', '\\%').replace('_', '\\_')}%"
+                escaped_token = token.replace("%", r"\%").replace("_", r"\_")
+                params[key] = f"%{escaped_token}%"
                 token_params.append(f"lower(chunk_text) LIKE :{key} ESCAPE '\\'")
             match_sql = " OR ".join(token_params)
             statement = text(

@@ -40,6 +40,11 @@ class Settings:
     database_url: str | None
     qdrant_url: str | None
     qdrant_vector_size: int
+    redis_url: str | None
+    redis_cache_ttl_seconds: int
+    redis_cache_max_value_bytes: int
+    redis_rate_limit_requests: int
+    redis_rate_limit_window_seconds: int
     user_key_encryption_key: str | None
     data_dir: Path
     chunk_size: int
@@ -82,6 +87,17 @@ class Settings:
             database_url=os.getenv("DATABASE_URL") or None,
             qdrant_url=os.getenv("QDRANT_URL") or None,
             qdrant_vector_size=int(os.getenv("QDRANT_VECTOR_SIZE", "1536")),
+            redis_url=os.getenv("REDIS_URL") or None,
+            redis_cache_ttl_seconds=int(os.getenv("REDIS_CACHE_TTL_SECONDS", "60")),
+            redis_cache_max_value_bytes=int(
+                os.getenv("REDIS_CACHE_MAX_VALUE_BYTES", "262144")
+            ),
+            redis_rate_limit_requests=int(
+                os.getenv("REDIS_RATE_LIMIT_REQUESTS", "120")
+            ),
+            redis_rate_limit_window_seconds=int(
+                os.getenv("REDIS_RATE_LIMIT_WINDOW_SECONDS", "60")
+            ),
             user_key_encryption_key=os.getenv("USER_KEY_ENCRYPTION_KEY") or None,
             data_dir=Path(os.getenv("DATA_DIR", "data/runtime")).expanduser(),
             chunk_size=int(os.getenv("CHUNK_SIZE", "900")),
@@ -105,7 +121,7 @@ class Settings:
                 origin.strip()
                 for origin in os.getenv(
                     "CORS_ORIGINS",
-                    "http://localhost:5173,http://localhost:8501",
+                    "http://localhost:5173",
                 ).split(",")
                 if origin.strip()
             ),
@@ -149,6 +165,29 @@ class Settings:
             raise ValueError("MAX_UPLOAD_BYTES must be positive.")
         if settings.qdrant_vector_size <= 0:
             raise ValueError("QDRANT_VECTOR_SIZE must be positive.")
+        if not 1 <= settings.redis_cache_ttl_seconds <= 3600:
+            raise ValueError("REDIS_CACHE_TTL_SECONDS must be between 1 and 3600.")
+        if not 1 <= settings.redis_cache_max_value_bytes <= 2 * 1024 * 1024:
+            raise ValueError(
+                "REDIS_CACHE_MAX_VALUE_BYTES must be between 1 and 2097152."
+            )
+        if not 1 <= settings.redis_rate_limit_requests <= 100_000:
+            raise ValueError(
+                "REDIS_RATE_LIMIT_REQUESTS must be between 1 and 100000."
+            )
+        if not 1 <= settings.redis_rate_limit_window_seconds <= 86_400:
+            raise ValueError(
+                "REDIS_RATE_LIMIT_WINDOW_SECONDS must be between 1 and 86400."
+            )
+        if settings.redis_url:
+            redis_url = urlparse(settings.redis_url)
+            if (
+                redis_url.scheme not in {"redis", "rediss"}
+                or not redis_url.hostname
+                or redis_url.query
+                or redis_url.fragment
+            ):
+                raise ValueError("REDIS_URL must be a redis:// or rediss:// URL.")
         if not 1 <= settings.invitation_expiry_hours <= 720:
             raise ValueError("INVITATION_EXPIRY_HOURS must be between 1 and 720.")
         if not 1 <= settings.smtp_port <= 65535:
@@ -194,6 +233,8 @@ class Settings:
             raise ValueError("DATABASE_URL is required when APP_ENV=production.")
         if self.app_env == "production" and not self.qdrant_url:
             raise ValueError("QDRANT_URL is required when APP_ENV=production.")
+        if self.app_env == "production" and not self.redis_url:
+            raise ValueError("REDIS_URL is required when APP_ENV=production.")
         if (
             self.app_env == "production"
             and self.database_url

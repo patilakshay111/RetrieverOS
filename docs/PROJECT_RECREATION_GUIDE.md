@@ -6,18 +6,20 @@ production roadmap below as already implemented.
 
 ## 1. Create the project and environment
 
-Install the project into the globally installed Python 3.11 selected for this
-project:
+Install the project into the globally installed Python 3.11-or-newer
+interpreter selected for this project. CI currently tests Python 3.11:
 
 ```powershell
 python --version
 python -m pip install -e ".[dev]"
 ```
 
-The dependency manifest is `pyproject.toml`; it includes the API, dashboard,
-retrieval, evaluation, migration, and test dependencies. The source package is
-under `src/rag_pipeline/`; tests, docs, sample documents, and the 50-case
-evaluation set are kept in their corresponding top-level folders.
+The Python dependency manifest is `pyproject.toml`; it includes the API,
+retrieval, evaluation, migration, and test dependencies. The independent React
+dashboard and its pinned dependencies are in `web/package.json` and
+`web/package-lock.json`. The source package is under `src/rag_pipeline/`;
+tests, docs, sample documents, and the 50-case evaluation set are kept in
+their corresponding top-level folders.
 
 FAISS and PyTorch platform wheels vary by operating system. If Windows cannot resolve a compatible FAISS wheel, use the supplied Docker image or a supported Linux/WSL environment rather than silently switching index formats.
 
@@ -31,16 +33,27 @@ source code or commit `.env`.
 The native-Python development setup uses SQLite for account-key, workspace,
 invitation, and audit storage; set
 `$env:DATABASE_URL = "sqlite:///./data/runtime/credentials.db"` in the API
-terminal before startup. Docker Compose overrides this with PostgreSQL and
-runs Alembic migrations before starting the API. Streamlit OIDC settings live
-in `.streamlit/secrets.toml` (use the example template and replace every
-placeholder). Set `SMTP_HOST`, `SMTP_PORT`, and `SMTP_FROM` to route invitation
-mail; Compose defaults to Mailpit at <http://localhost:8025>.
+terminal before startup, then upgrade the database schema:
+
+```powershell
+python -m alembic upgrade head
+```
+
+Docker Compose overrides this with PostgreSQL and runs Alembic migrations
+before starting the API. On a new Keycloak data
+volume, Compose imports `deploy/keycloak/hybrid-rag-realm.json`, including the
+public React client configured for PKCE S256 and the API audience mapper.
+Keycloak does not overwrite an existing realm from an import; update an
+already-persisted `hybrid-rag` realm in the Keycloak Admin Console. Set
+`SMTP_HOST`, `SMTP_PORT`, and `SMTP_FROM` to route invitation mail; Compose
+defaults to Mailpit at <http://localhost:8025>.
 
 Production mode requires HTTPS OIDC, PostgreSQL, an encryption key, and
-restricted CORS. API-key authentication is retained for local development; it
-is not the production identity mechanism. Uploads are size limited, and the
-health/readiness endpoints do not expose secrets.
+restricted CORS. The SPA uses Keycloak Authorization Code + PKCE and keeps
+tokens in memory; the API validates tokens and checks workspace memberships
+on every protected request. API-key authentication is retained for local
+development; it is not the production identity mechanism. Uploads are size
+limited, and the health/readiness endpoints do not expose secrets.
 
 ## 3. Build document loading and chunking
 
@@ -104,14 +117,19 @@ Parse each claim and cited chunk separately. Ask an LLM judge whether the comple
 
 ## 7. Wire the LangGraph workflow
 
-Define the shared graph state as a Pydantic `BaseModel`. Use small sequential nodes for retrieval, generation/abstention, citation verification, and confidence scoring. Compile with `MemorySaver` and pass a stable `thread_id` in every invocation; retain a bounded recent-turn history so follow-up answers can use earlier context. Use the same state and service from API and evaluation code.
+Define the shared graph state as a Pydantic `BaseModel`. Use small sequential nodes for retrieval, generation/abstention, citation verification, and confidence scoring. Retain a bounded recent-turn history so follow-up answers can use earlier context. Use the same state and service from API and evaluation code. In PostgreSQL-backed API operation, compile with the managed LangGraph PostgreSQL checkpointer; use `MemorySaver` only for local/test operation without PostgreSQL.
 
 Confidence is a weighted composite of retrieval confidence (40%), verified
 claim coverage (35%), and answer completeness (25%). Keep component scores in
 the response. Below the retrieval threshold, do not call the generator;
 return a clear no-answer response and the closest documents to check manually.
-The current LangGraph checkpointer is in-memory; its thread ID is namespaced by
-user and workspace but history is not durable across process restarts.
+Create conversation metadata in PostgreSQL and expose scoped list/create/read/delete
+endpoints. Generate conversation UUIDs on the server, validate ownership against
+the authenticated user and active workspace before every ask, and derive LangGraph
+thread IDs from that scope plus the conversation UUID. Do not treat a client-supplied
+thread identifier as an authorization key. Deleting a conversation also deletes
+its regular and comparison checkpoint variants. The PostgreSQL-backed path survives
+API process restarts; local SQLite/test mode can use an in-memory checkpointer.
 
 ## 8. Expose the service and dashboard
 
@@ -125,31 +143,70 @@ Create FastAPI endpoints:
 - `POST /v1/compare`
 - `GET`, `PUT`, `DELETE /v1/account/openai-key`
 - `GET /v1/workspaces`
+- `POST /v1/workspaces` (create a named workspace and initial admin membership)
+- `PATCH /v1/workspaces/{workspace_id}` (workspace-admin edit)
+- `GET`, `POST /v1/workspaces/{workspace_id}/roles` (workspace-scoped role definitions)
 - `GET`, `POST /v1/workspaces/{workspace_id}/members`
 - `PUT`, `DELETE /v1/workspaces/{workspace_id}/members/{user_id}`
 - `POST /v1/workspaces/{workspace_id}/invitations`
-- `POST /v1/invitations/{token}/accept`
-- `GET`, `POST /v1/roles`
+- `POST /v1/invitations/accept` (the invitation token is supplied in the JSON
+  request body)
 
 Validate inputs, restrict uploads to supported formats and a bounded size,
 authenticate local requests with `X-API-Key` when configured, and document
 request and response schemas through OpenAPI. OIDC-authenticated users can
-save, rotate, and delete their own encrypted OpenAI key. Build a Streamlit
-dashboard that asks questions, displays ranked chunks/citation checks and
-confidence, and compares hybrid with dense-only retrieval.
+save, rotate, and delete their own encrypted OpenAI key. The React dashboard
+in `web/` provides sign-in, workspace switching, chat and conversation
+history, citation/evidence display, hybrid-versus-dense comparison, document
+upload with chunking/access-role choices, private key management, and
+role-gated workspace administration and operations. Keep UI permission checks
+as usability only; the API remains authoritative for access control.
 
-The API provisions a personal workspace for each verified OIDC subject and
-uses PostgreSQL—not token-supplied workspace or role claims—as the source of
-membership and workspace roles. Clients select a workspace with
-`X-Workspace-ID`; without the header, the personal workspace is selected.
-Workspace admins are confined to their active workspace, existing global role
-definitions are assigned through membership, and only platform admins may
-create global roles or administer across workspaces. Invitations contain
-single-use, expiring random tokens, persist only the SHA-256 token hash, and
-can be accepted only by an account with the matching verified OIDC email.
-Platform-admin cross-workspace activity is persisted with the actor, action,
-target workspace, timestamp, and request ID; request content and secrets are
+The API does not provision a default workspace. A first-time signed-in user
+creates a named workspace with a description and becomes its initial admin.
+Users can create additional isolated workspaces later. A workspace invitee
+can accept an invitation before creating a workspace; after acceptance the
+dashboard selects the invited workspace. Invitees must register and verify
+the same email address used for the invitation.
+
+Workspace memberships and roles come from PostgreSQL—not token-supplied
+workspace or role claims. Workspace-scoped routes require an active
+`X-Workspace-ID` and verify membership. Each workspace has its own built-in
+roles and role definitions; its admins can create roles, choose document
+permissions, edit workspace details, manage members, and invite users with
+one or more roles. Capabilities are `documents:read`, `documents:query`,
+`documents:upload`, and `documents:update`. A member receives the union of
+their assigned-role permissions. Document uploads can be ACL-limited to
+multiple roles in that workspace; the API validates those roles and enforces
+the required permission on inventory, query, upload, and replacement routes.
+The Keycloak `platform-admin` realm role is separate from workspace roles and
+its cross-workspace actions are audited with the actor, action, target
+workspace, timestamp, and request ID; request content and secrets are
 excluded.
+
+### Onboard users and test workspace access
+
+1. Register and verify a user through Keycloak. Local verification messages
+   appear in Mailpit at <http://localhost:8025>.
+2. On first sign-in with no workspace memberships, enter a workspace name and
+   description. The creator becomes that workspace's administrator. To create
+   another isolated workspace later, use **Create another workspace**.
+3. In **Workspace**, edit the name or description if needed. Create a role,
+   select its permissions, and save it before inviting a user. Assign one or
+   more existing roles in the invitation form; role permissions are not
+   Keycloak realm roles.
+4. The invitee registers with the invited email, verifies it through Mailpit,
+   and accepts the invitation. The app selects the invited workspace
+   automatically, even if this is the invitee's first workspace.
+5. In **Documents**, choose a chunking strategy and one or more workspace
+   roles for the document ACL. Non-admin members can assign only roles they
+   hold. `documents:read` gates inventory, `documents:upload` gates new
+   sources, and `documents:update` gates replacements. `documents:query`
+   gates chat and conversation history. The API remains authoritative if a
+   browser control is bypassed.
+6. To verify isolation, invite a second user with a different role and
+   confirm each user can list/query only documents permitted by their
+   workspace membership and document ACL.
 
 ## 9. Seed, test, and evaluate
 
@@ -166,6 +223,11 @@ python -m pytest
 rag-pipeline-seed
 rag-pipeline-reindex
 python -m rag_pipeline.evaluation.run
+npm --prefix web ci
+npm --prefix web test
+npm --prefix web run lint
+npm --prefix web run build
+npm --prefix web audit
 ```
 
 The evaluation runner compares fixed, recursive, and semantic chunkers using
@@ -175,24 +237,33 @@ CI runs the offline deterministic tests rather than making paid model calls.
 
 ## 10. Containerize and demonstrate
 
-Docker Compose starts the API/dashboard, PostgreSQL, Redis, Qdrant, Keycloak,
-and Mailpit. It runs the Alembic migration before the API, and mounts a
-persistent volume for raw documents and the versioned FAISS index. Run:
+Docker Compose starts the API, React dashboard, PostgreSQL, Redis, Qdrant,
+Keycloak, and Mailpit. It runs the Alembic migration before the API, and
+mounts persistent volumes for application data and service state. Run:
 
 ```powershell
 docker compose up --build
 docker compose exec api rag-pipeline-seed
 ```
 
-GitHub Actions runs tests on Python 3.11, validates Compose, and builds the
-container image after the tests pass. It does not publish or deploy the image.
+GitHub Actions runs Python and frontend tests, lint, and build checks; it then
+validates Compose and builds the API image. It does not publish or deploy the
+image.
 With Compose's Qdrant and PostgreSQL settings present, shared retrieval uses
 Qdrant and the PostgreSQL chunk catalog; native Python without both settings
-uses local FAISS/BM25. Redis is not wired into the request path. Durable
-conversation checkpoints, the React/Vite dashboard, OpenTelemetry, Kubernetes,
-and deployment automation remain future work. Workspace authorization,
-invitation endpoints, and privileged-access auditing are implemented; the
-Streamlit dashboard does not yet expose their full management workflows.
+uses local FAISS/BM25. PostgreSQL-backed conversation checkpoints are used when
+`DATABASE_URL` is configured; local operation uses in-memory checkpoints.
+Redis backs API rate limits and optional stateless answer caching. Production
+requires it; Compose configures the service automatically. Native development
+can leave `REDIS_URL` blank unless a Redis server is running—the VS Code
+extension is only a client. `/readyz` checks configured PostgreSQL, Qdrant,
+and Redis services, and reports sanitized dependency status. Before rebuilding
+the index, run `python -m rag_pipeline.reindex --dry-run` to verify every
+archived source digest without writing to the index. Workspace authorization,
+invitation endpoints, privileged-access auditing, and their React dashboard
+workflows are implemented, but must be exercised against the full local stack.
+OpenTelemetry and deployment automation remain future work; Kubernetes is out
+of scope.
 For native local development, leave `QDRANT_URL` blank; Compose configures its
 internal Qdrant endpoint. The API manages the configured Qdrant client with its
 application lifespan. `QDRANT_VECTOR_SIZE` defaults to 1536 and must match
@@ -217,5 +288,8 @@ quality.
 - [ ] Dense/hybrid comparison returns both result sets.
 - [ ] Unit tests pass and all three evaluation strategies complete.
 - [ ] All offline tests pass; Compose config and the container build are checked.
+- [ ] Frontend tests, lint, and production build pass.
+- [ ] Local Compose sign-in, invitation, upload/chat, and two-workspace
+      isolation scenarios pass before describing the integration as verified.
 - [ ] Production use additionally has HTTPS OIDC, PostgreSQL, durable storage,
       secret management, observability, recovery, and a tested deployment target.

@@ -181,18 +181,12 @@ class KnowledgeBase:
         roles = sorted(set(required_roles or []))
         document_key = self._document_key(context.workspace_id, filename)
         old_document = self._snapshot.documents.get(document_key)
-        if (
-            old_document is not None
-            and not context.platform_admin
-            and "admin" not in context.roles
-            and old_document.owner_id != context.user_id
-        ):
-            raise PermissionError("Only the document owner or a workspace admin may replace it.")
+        if old_document is not None:
+            self._require_document_update(context, old_document)
         digest = hashlib.sha256(content).hexdigest()
         embedder = embeddings or self.embeddings
         if embedder is None:
             raise RuntimeError("An OpenAI embedding provider is required for ingestion.")
-        self._save_raw(filename, digest, content)
         sections = load_document(filename, content)
         drafts = chunk_sections(
             sections,
@@ -208,13 +202,8 @@ class KnowledgeBase:
         with self._write_lock:
             previous = self._snapshot
             old_document = previous.documents.get(document_key)
-            if (
-                old_document is not None
-                and not context.platform_admin
-                and "admin" not in context.roles
-                and old_document.owner_id != context.user_id
-            ):
-                raise PermissionError("Only the document owner or a workspace admin may replace it.")
+            if old_document is not None:
+                self._require_document_update(context, old_document)
             retained = [
                 chunk
                 for chunk in previous.chunks
@@ -327,6 +316,8 @@ class KnowledgeBase:
                     raise ValueError(
                         "Embedding dimensions do not match QDRANT_VECTOR_SIZE."
                     )
+            self._save_raw(filename, digest, content)
+            if self.vector_store is not None and self.lexical_store is not None:
                 if accepted_chunks:
                     self.vector_store.upsert(
                         accepted_chunks,
@@ -364,3 +355,21 @@ class KnowledgeBase:
                 )
             )
         return sorted(documents, key=lambda item: item.source.casefold())
+
+    def get_document(self, workspace_id: str, source: str) -> DocumentInfo | None:
+        return self._snapshot.documents.get(self._document_key(workspace_id, source))
+
+    @staticmethod
+    def _require_document_update(
+        context: AccessContext, document: DocumentInfo
+    ) -> None:
+        if context.platform_admin:
+            return
+        if "documents:update" not in context.permissions:
+            raise PermissionError("The documents:update permission is required.")
+        if not context.permits(
+            document.workspace_id, document.owner_id, document.required_roles
+        ):
+            raise PermissionError(
+                "The caller does not have access to the document being replaced."
+            )

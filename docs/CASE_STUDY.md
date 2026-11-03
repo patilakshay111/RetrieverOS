@@ -10,7 +10,7 @@ This project indexes Markdown, plain text, HTML, and PDF documents. It stores co
 
 Queries use dense and sparse top-k retrieval, configurable weighted Reciprocal Rank Fusion, a cross-encoder second pass, and a grounded OpenAI answer with numbered evidence. A judge checks each claim-citation pair and answer completeness. Retrieval, citation coverage, and completeness appear separately in the confidence breakdown. Low-confidence questions receive an explicit abstention.
 
-The workflow uses a Pydantic `BaseModel` as LangGraph state and `MemorySaver` for in-process conversation checkpoints, bounded to 20 turns. FastAPI exposes ingestion, asking, comparison, and document inventory endpoints; Streamlit exposes ranked chunks, citation checks, and hybrid-versus-dense comparison.
+The workflow uses a Pydantic `BaseModel` as LangGraph state and keeps recent conversation turns bounded. PostgreSQL-backed deployments persist conversation checkpoints; local/test operation uses `MemorySaver`. FastAPI exposes ingestion, asking, comparison, workspace, and document APIs. The React dashboard provides Keycloak sign-in, workspace-scoped chat, citation/evidence review, hybrid-versus-dense comparison, document upload, and workspace administration.
 
 ## Evaluation
 
@@ -26,13 +26,13 @@ The runner evaluates all 50 questions with fixed, recursive, and semantic chunki
 
 ## Four-minute demo walkthrough
 
-1. Start the API and dashboard, then ingest a new Markdown runbook through `POST /v1/ingest` or `rag-pipeline-seed`.
+1. Start the Compose stack and sign in to the dashboard, then ingest a new Markdown runbook from Documents or run `rag-pipeline-seed`.
 2. Ask a direct lookup such as “How long do OAuth access tokens last?” and show the answer, source chunk, verified citation, and confidence dimensions.
 3. Ask a multi-part question that joins policies, then inspect the ranked evidence and per-claim citation outcomes.
 4. Ask an absent question, such as a private phone number, and show that the system abstains rather than inventing a fact.
-5. Enable “Compare hybrid retrieval with dense-only retrieval” and explain when exact keyword matching changes the retrieved evidence.
+5. Compare hybrid retrieval with dense-only retrieval from Chat and explain when exact keyword matching changes the retrieved evidence.
 6. Point to `data/evaluation/results/chunking-comparison.md` after running the golden suite; discuss actual observed metrics, not estimates.
 
 ## Tradeoffs and next production steps
 
-FAISS keeps a demo self-contained and local, following the interview rules' preference over the project brief's optional ChromaDB/Qdrant choice. Generation and embeddings remain hosted APIs. `MemorySaver` is process-local and is intended for a single demo instance; a multi-worker deployment should use a durable, shared checkpointer. Add organization-specific identity integration, rate limiting, audit policy, retention controls, backup monitoring, and a managed vector service before processing real confidential documents at scale.
+Local FAISS/BM25 supports native development, while Compose can use Qdrant and PostgreSQL for shared retrieval and durable state. Generation and embeddings use hosted APIs. The project includes Keycloak authentication, workspace authorization, Redis rate limiting/cache, and audited platform-admin access, but local integration and production deployment still require validation. Add organization-specific retention, backup/recovery, observability, and measured capacity controls before processing confidential documents at scale.
