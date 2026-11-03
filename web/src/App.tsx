@@ -37,7 +37,10 @@ function LandingPage() {
     <main className="landing-layout">
       <section className="landing-intro">
         <a className="brand" href="/" aria-label="RetrieverOS home">
-          <img className="brand-logo" src="/logo-dark.png" alt="RetrieverOS" />
+          <picture>
+            <source media="(prefers-color-scheme: light)" srcSet="/logo-light.png" />
+            <img className="brand-logo" src="/logo-dark.png" alt="RetrieverOS" />
+          </picture>
         </a>
         <div className="landing-copy">
           <p className="eyebrow">Private knowledge, grounded answers</p>
