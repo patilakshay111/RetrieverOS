@@ -196,7 +196,7 @@ class KeycloakAdmin:
                 "consentRequired": False,
                 "config": {
                     "id.token.claim": "true",
-                    "access.token.claim": "false",
+                    "access.token.claim": "true",
                     "userinfo.token.claim": "true",
                 },
             },

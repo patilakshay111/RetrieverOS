@@ -31,6 +31,13 @@ export interface OidcClient {
     email?: string;
     realm_access?: { roles?: string[] };
   };
+  idTokenParsed?: {
+    sub?: string;
+    name?: string;
+    preferred_username?: string;
+    email?: string;
+    realm_access?: { roles?: string[] };
+  };
   init(options: {
     onLoad: "check-sso";
     flow: "standard";
@@ -74,6 +81,9 @@ function createOidcClient(): OidcClient {
     get tokenParsed() {
       return client.tokenParsed;
     },
+    get idTokenParsed() {
+      return client.idTokenParsed;
+    },
     init: (options) =>
       client.init({ ...options, redirectUri }),
     login: () =>
@@ -100,17 +110,20 @@ function createOidcClient(): OidcClient {
 const defaultClient = createOidcClient();
 
 function getUser(client: OidcClient): AuthUser | null {
-  const id = client.tokenParsed?.sub;
+  // Identity claims live in the ID token (the realm's protocol mappers add
+  // them there); the access token only carries what the API needs.
+  const claims = client.idTokenParsed ?? client.tokenParsed;
+  const id = claims?.sub;
   if (!id) return null;
   return {
     id,
     name:
-      client.tokenParsed?.name ??
-      client.tokenParsed?.preferred_username ??
-      client.tokenParsed?.email ??
+      claims?.name ??
+      claims?.preferred_username ??
+      claims?.email ??
       "Workspace member",
-    email: client.tokenParsed?.email,
-    platformAdmin: client.tokenParsed?.realm_access?.roles?.includes("platform-admin") ?? false,
+    email: claims?.email,
+    platformAdmin: claims?.realm_access?.roles?.includes("platform-admin") ?? false,
   };
 }
 
