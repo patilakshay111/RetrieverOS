@@ -8,6 +8,9 @@ function unauthenticatedClient(): OidcClient {
     authenticated: false,
     init: async () => false,
     login: async () => undefined,
+    register: async () => undefined,
+    loginWithGoogle: async () => undefined,
+    forgotPassword: async () => undefined,
     logout: async () => undefined,
     updateToken: async () => false,
     clearToken: () => undefined,
@@ -21,6 +24,9 @@ function authenticatedClient(): OidcClient {
     tokenParsed: { sub: "member-1", name: "Workspace Member" },
     init: async () => true,
     login: async () => undefined,
+    register: async () => undefined,
+    loginWithGoogle: async () => undefined,
+    forgotPassword: async () => undefined,
     logout: async () => undefined,
     updateToken: async () => true,
     clearToken: () => undefined,
@@ -33,7 +39,13 @@ describe("sign-in landing page", () => {
 
     expect(await screen.findByRole("heading", { name: "Sign in to your workspace" })).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Continue with organization account" }),
+      screen.getByRole("button", { name: "Sign in with email & password" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Continue with Google/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Create an account" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
   });

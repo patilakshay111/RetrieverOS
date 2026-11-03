@@ -39,6 +39,9 @@ export interface OidcClient {
   }): Promise<boolean>;
   login(): Promise<void>;
   logout(): Promise<void>;
+  register(): Promise<void>;
+  loginWithGoogle(): Promise<void>;
+  forgotPassword(): Promise<void>;
   updateToken(minValidity: number): Promise<boolean>;
   clearToken(): void;
 }
@@ -49,6 +52,9 @@ interface AuthContextValue {
   error: string | null;
   login(): Promise<void>;
   logout(): Promise<void>;
+  register(): Promise<void>;
+  loginWithGoogle(): Promise<void>;
+  forgotPassword(): Promise<void>;
   request: ApiRequest;
 }
 
@@ -56,6 +62,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 function createOidcClient(): OidcClient {
   const client = new Keycloak(authConfig);
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
   return {
     get authenticated() {
       return client.authenticated;
@@ -69,6 +76,19 @@ function createOidcClient(): OidcClient {
     init: (options) => client.init(options),
     login: () => client.login(),
     logout: () => client.logout(),
+    register: () => client.register(),
+    loginWithGoogle: () =>
+      (client as any).login({ idpHint: "google" }),
+    forgotPassword: () => {
+      const resetUrl = new URL(
+        `${authConfig.url}/realms/${authConfig.realm}/login-actions/reset-credentials`
+      );
+      resetUrl.searchParams.set("client_id", authConfig.clientId);
+      resetUrl.searchParams.set("redirect_uri", `${origin}/`);
+      resetUrl.searchParams.set("scope", "openid");
+      window.location.assign(resetUrl.toString());
+      return Promise.resolve();
+    },
     updateToken: (minValidity) => client.updateToken(minValidity),
     clearToken: () => client.clearToken(),
   };
@@ -151,6 +171,39 @@ export function AuthProvider({
     }
   }, [client]);
 
+  const register = useCallback(async () => {
+    try {
+      await client.register();
+    } catch {
+      const message = "Unable to open the sign-up page. Check the identity provider and retry.";
+      setError(message);
+      setStatus("error");
+      throw new Error(message);
+    }
+  }, [client]);
+
+  const loginWithGoogle = useCallback(async () => {
+    try {
+      await (client as any).login({ idpHint: "google" });
+    } catch {
+      const message = "Unable to start sign-in with Google. Check the identity provider and retry.";
+      setError(message);
+      setStatus("error");
+      throw new Error(message);
+    }
+  }, [client]);
+
+  const forgotPassword = useCallback(async () => {
+    try {
+      await client.forgotPassword();
+    } catch {
+      const message = "Unable to open the password reset page. Check the identity provider and retry.";
+      setError(message);
+      setStatus("error");
+      throw new Error(message);
+    }
+  }, [client]);
+
   const logout = useCallback(async () => {
     try {
       await client.logout();
@@ -200,8 +253,18 @@ export function AuthProvider({
   );
 
   const value = useMemo(
-    () => ({ status, user, error, login, logout, request }),
-    [status, user, error, login, logout, request],
+    () => ({
+      status,
+      user,
+      error,
+      login,
+      logout,
+      register,
+      loginWithGoogle,
+      forgotPassword,
+      request,
+    }),
+    [status, user, error, login, logout, register, loginWithGoogle, forgotPassword, request]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

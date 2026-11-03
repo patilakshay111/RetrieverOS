@@ -1,0 +1,264 @@
+"""Configure Keycloak after the stack starts.
+
+This script is idempotent and is meant to be run once after ``docker compose up``
+(or after ``docker compose down -v`` + a fresh start) so a local/development
+Keycloak realm is ready for:
+
+* email/password sign-in, sign-up and password reset (already enabled in the
+  realm import),
+* Google OAuth sign-in (federated identity provider), linked by email to the
+  same account,
+* outgoing mail through Gmail when Google OAuth credentials are configured,
+  otherwise through Mailpit,
+* a developer admin account that can be used to test the platform.
+
+Environment variables (all optional with sensible dev defaults):
+  KEYCLOAK_URL              http://localhost:8080
+  KEYCLOAK_ADMIN            admin
+  KEYCLOAK_ADMIN_PASSWORD   (from .env, required)
+  KEYCLOAK_REALM            hybrid-rag
+  GOOGLE_OAUTH_CLIENT_ID
+  GOOGLE_OAUTH_CLIENT_SECRET
+  SMTP_HOST / SMTP_PORT / SMTP_USERNAME / SMTP_PASSWORD / SMTP_USE_STARTTLS / SMTP_FROM
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Any
+
+import requests
+from dotenv import load_dotenv
+
+# Load local environment values without overriding values supplied by the process.
+load_dotenv()
+
+KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "http://localhost:8080").rstrip("/")
+KEYCLOAK_ADMIN = os.getenv("KEYCLOAK_ADMIN", "admin")
+KEYCLOAK_ADMIN_PASSWORD = os.getenv("KEYCLOAK_ADMIN_PASSWORD", "")
+REALM = os.getenv("KEYCLOAK_REALM", "hybrid-rag")
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
+GOOGLE_CONFIGURED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+
+DEV_ADMIN_EMAIL = os.getenv("DEV_ADMIN_EMAIL", "dev@hybrid-rag.local")
+DEV_ADMIN_PASSWORD = os.getenv("DEV_ADMIN_PASSWORD", "DevAdmin123!")
+DEV_ADMIN_USERNAME = os.getenv("DEV_ADMIN_USERNAME", "dev.admin")
+
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = os.getenv("SMTP_PORT", "1025").strip()
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+SMTP_USE_STARTTLS = os.getenv("SMTP_USE_STARTTLS", "false").strip().lower() in {
+    "true",
+    "1",
+    "yes",
+}
+SMTP_FROM = os.getenv("SMTP_FROM", "Hybrid RAG <no-reply@hybrid-rag.local>")
+
+
+class KeycloakAdmin:
+    def __init__(self) -> None:
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+        self._token: str | None = None
+
+    def _admin_token(self) -> str:
+        if self._token:
+            return self._token
+        if not KEYCLOAK_ADMIN_PASSWORD:
+            raise RuntimeError(
+                "KEYCLOAK_ADMIN_PASSWORD is required to configure Keycloak."
+            )
+        resp = self._session.post(
+            f"{KEYCLOAK_URL}/realms/master/protocol/openid-connect/token",
+            data={
+                "grant_type": "password",
+                "client_id": "admin-cli",
+                "username": KEYCLOAK_ADMIN,
+                "password": KEYCLOAK_ADMIN_PASSWORD,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        self._token = resp.json()["access_token"]
+        self._session.headers.update({"Authorization": f"Bearer {self._token}"})
+        return self._token
+
+    def _realm(self) -> dict[str, Any]:
+        resp = self._session.get(
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}", timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _put(self, path: str, payload: Any) -> requests.Response:
+        resp = self._session.put(path, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp
+
+    def _post(self, path: str, payload: Any) -> requests.Response:
+        resp = self._session.post(path, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp
+
+    def _get(self, path: str) -> requests.Response:
+        resp = self._session.get(path, timeout=30)
+        resp.raise_for_status()
+        return resp
+
+    def configure_smtp(self) -> None:
+        # Explicit SMTP settings win; otherwise Gmail when Google OAuth is set,
+        # else Mailpit (same resolution as the application mailer).
+        if SMTP_HOST:
+            host, port = SMTP_HOST, SMTP_PORT
+        elif GOOGLE_CONFIGURED:
+            host, port = "smtp.gmail.com", "587"
+        else:
+            host, port = "mailpit", "1025"
+
+        username = SMTP_USERNAME or None
+        password = SMTP_PASSWORD or None
+        auth = bool(username and password)
+
+        if host == "mailpit":
+            ssl = "none"
+            starttls = False
+        else:
+            ssl = "starttls" if SMTP_USE_STARTTLS else "none"
+            starttls = SMTP_USE_STARTTLS
+
+        realm = self._realm()
+        realm["smtpServer"] = {
+            "host": host,
+            "port": port,
+            "from": SMTP_FROM,
+            "fromDisplayName": "Hybrid RAG Studio",
+            "auth": auth,
+            "ssl": ssl,
+            "starttls": starttls,
+            "user": username or "",
+            "password": password or "",
+            "replyTo": "",
+            "replyToDisplayName": "",
+            "envelopeFrom": "",
+        }
+        self._put(f"{KEYCLOAK_URL}/admin/realms/{REALM}", realm)
+        print(f"[configure_keycloak] SMTP configured: {host}:{port} (auth={auth})")
+
+    def configure_google_identity_provider(self) -> None:
+        if not GOOGLE_CONFIGURED:
+            print(
+                "[configure_keycloak] GOOGLE_OAUTH_CLIENT_ID/SECRET not set, "
+                "skipping Google identity provider."
+            )
+            return
+
+        instances_path = (
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/identity-provider/instances"
+        )
+        existing: list[dict[str, Any]] = self._get(instances_path).json()
+        for inst in existing:
+            if inst.get("providerId") == "google":
+                print("[configure_keycloak] Google identity provider already present.")
+                return
+
+        config = {
+            "clientId": GOOGLE_CLIENT_ID,
+            "clientSecret": GOOGLE_CLIENT_SECRET,
+            "alias": "google",
+            "displayName": "Google",
+            "trustEmail": "true",  # auto-link a Google account to a local user
+            "loginHint": "",
+            "guiOrder": "",
+            "postBrokerLoginFlowIdentifier": "first broker login",
+            "firstBrokerLoginFlowIdentifier": "first broker login",
+        }
+        self._post(
+            instances_path,
+            {
+                "providerId": "google",
+                "config": config,
+                "alias": "google",
+                "displayName": "Google",
+                "enabled": True,
+                "trustEmail": True,
+            },
+        )
+        print("[configure_keycloak] Google identity provider added (auto-link email).")
+
+    def _ensure_dev_admin_user(self) -> dict[str, Any]:
+        users_path = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users"
+        existing = self._get(
+            f"{users_path}?email={DEV_ADMIN_EMAIL}&exact=true"
+        ).json()
+        if existing:
+            user = existing[0]
+            print(f"[configure_keycloak] Dev admin user already exists ({user['id']}).")
+            return user
+
+        payload = {
+            "email": DEV_ADMIN_EMAIL,
+            "username": DEV_ADMIN_USERNAME,
+            "firstName": "Dev",
+            "lastName": "Admin",
+            "enabled": True,
+            "emailVerified": True,
+            "credentials": [
+                {
+                    "type": "password",
+                    "value": DEV_ADMIN_PASSWORD,
+                    "temporary": False,
+                }
+            ],
+        }
+        resp = self._post(users_path, payload)
+        # Keycloak returns 201 with the Location header pointing at the new user.
+        user_id = resp.headers.get("Location", "").rsplit("/", 1)[-1]
+        user = {"id": user_id}
+        print(
+            f"[configure_keycloak] Created dev admin user ({user_id}): "
+            f"{DEV_ADMIN_EMAIL}"
+        )
+        return user
+
+    def _grant_platform_admin_role(self, user: dict[str, Any]) -> None:
+        roles_path = f"{KEYCLOAK_URL}/admin/realms/{REALM}/roles/platform-admin"
+        role = self._get(roles_path).json()
+        user_id = user["id"]
+        mappings_path = (
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{user_id}/role-mappings/realm"
+        )
+        self._put(mappings_path, [role])
+        print(
+            f"[configure_keycloak] Granted realm role 'platform-admin' to dev admin."
+        )
+
+    def run(self) -> None:
+        self._admin_token()
+        self.configure_smtp()
+        self.configure_google_identity_provider()
+        dev_admin = self._ensure_dev_admin_user()
+        self._grant_platform_admin_role(dev_admin)
+        print("[configure_keycloak] Configuration complete.")
+
+
+def main() -> int:
+    try:
+        KeycloakAdmin().run()
+    except requests.RequestException as error:
+        body = ""
+        if error.response is not None:
+            body = error.response.text[:500]
+        print(
+            f"[configure_keycloak] ERROR: {error}\n{body}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -31,7 +31,7 @@ function removeInvitationTokenFromUrl() {
 }
 
 function LandingPage() {
-  const { login, error } = useAuth();
+  const { login, register, loginWithGoogle, forgotPassword, error } = useAuth();
 
   return (
     <main className="landing-layout">
@@ -69,18 +69,45 @@ function LandingPage() {
           <p className="eyebrow">Welcome back</p>
           <h2 id="sign-in-title">Sign in to your workspace</h2>
           <p className="muted-copy">
-            Continue using your organization account. Join an invitation or create a named workspace to get started.
+            Sign in with your organization account, or create a new one.
+            Sign-up and password reset are handled by your identity provider.
           </p>
           {error && <p className="notice notice-error" role="alert">{error}</p>}
+          <div className="sign-in-actions">
+            <button
+              type="button"
+              className="button button-primary sign-in-button"
+              onClick={() => void login().catch(() => undefined)}
+            >
+              Sign in with email &amp; password
+            </button>
+            <button
+              type="button"
+              className="button button-outline sign-in-button"
+              onClick={() => void loginWithGoogle().catch(() => undefined)}
+            >
+              <span aria-hidden="true">G</span> Continue with Google
+            </button>
+          </div>
+          <p className="sign-in-divider"><span>or</span></p>
           <button
             type="button"
-            className="button button-primary sign-in-button"
-            onClick={() => void login().catch(() => undefined)}
+            className="button button-text create-account-button"
+            onClick={() => void register().catch(() => undefined)}
           >
-            Continue with organization account
+            Create an account
           </button>
-          <p className="sign-in-note">
-            Your session is managed by the identity provider. Access tokens stay in memory.
+          <p className="sign-in-note sign-in-help">
+            <button
+              type="button"
+              className="link-button"
+              onClick={() => void forgotPassword().catch(() => undefined)}
+            >
+              Forgot your password?
+            </button>
+            &nbsp;·&nbsp;
+            Your session is managed by the identity provider. Access tokens stay
+            in memory.
           </p>
         </div>
       </section>

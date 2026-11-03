@@ -9,20 +9,19 @@ from rag_pipeline.config import Settings
 
 class SMTPInvitationMailer:
     def __init__(self, settings: Settings):
-        host = settings.smtp_host
-        sender = settings.smtp_from
+        effective = settings.smtp_effective()
+        host = effective["host"]
+        sender = effective["from"]
         if not host or not sender:
             raise RuntimeError("SMTP invitation delivery is not configured.")
-        if bool(settings.smtp_username) != bool(settings.smtp_password):
-            raise RuntimeError("SMTP credentials are incomplete.")
         self._host = host
-        self._port = settings.smtp_port
+        self._port = effective["port"]
         self._sender = sender
-        self._starttls = settings.smtp_use_starttls
+        self._starttls = effective["starttls"]
+        username = effective["username"]
+        password = effective["password"]
         self._credentials = (
-            (settings.smtp_username, settings.smtp_password)
-            if settings.smtp_username and settings.smtp_password
-            else None
+            (username, password) if username and password else None
         )
 
     def send_invitation(self, email: str, invite_url: str) -> None:

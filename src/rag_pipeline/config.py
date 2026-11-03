@@ -37,6 +37,8 @@ class Settings:
     oidc_issuer_url: str | None
     oidc_jwks_url: str | None
     oidc_audience: str
+    google_oauth_client_id: str | None
+    google_oauth_client_secret: str | None
     database_url: str | None
     qdrant_url: str | None
     qdrant_vector_size: int
@@ -84,6 +86,8 @@ class Settings:
             oidc_issuer_url=os.getenv("OIDC_ISSUER_URL") or None,
             oidc_jwks_url=os.getenv("OIDC_JWKS_URL") or None,
             oidc_audience=os.getenv("OIDC_AUDIENCE", "hybrid-rag-api"),
+            google_oauth_client_id=os.getenv("GOOGLE_OAUTH_CLIENT_ID") or None,
+            google_oauth_client_secret=os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or None,
             database_url=os.getenv("DATABASE_URL") or None,
             qdrant_url=os.getenv("QDRANT_URL") or None,
             qdrant_vector_size=int(os.getenv("QDRANT_VECTOR_SIZE", "1536")),
@@ -214,6 +218,44 @@ class Settings:
             ):
                 raise ValueError("QDRANT_URL must be an HTTP(S) base URL.")
         return settings
+
+    def google_oauth_configured(self) -> bool:
+        """True when Google OAuth client credentials are provided."""
+        return bool(self.google_oauth_client_id and self.google_oauth_client_secret)
+
+    def smtp_effective(self) -> dict:
+        """Resolve the SMTP server to use for outgoing mail.
+
+        Explicit SMTP_HOST/SMTP_PORT/etc. always win. Otherwise, when Google
+        OAuth is configured the app sends mail through Gmail; otherwise it falls
+        back to the local Mailpit catcher used in development.
+        """
+        if self.smtp_host:
+            host = self.smtp_host
+        elif self.google_oauth_configured():
+            host = "smtp.gmail.com"
+        else:
+            host = "mailpit"
+
+        if host == "mailpit":
+            port = 1025
+            starttls = False
+            username = None
+            password = None
+        else:
+            port = self.smtp_port or 587
+            starttls = self.smtp_use_starttls or host == "smtp.gmail.com"
+            username = self.smtp_username
+            password = self.smtp_password
+
+        return {
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "starttls": starttls,
+            "from": self.smtp_from or "Hybrid RAG <no-reply@hybrid-rag.local>",
+        }
 
     # Prevent an accidentally public API or unconfigured production model from starting.
     def validate_production(self) -> None:

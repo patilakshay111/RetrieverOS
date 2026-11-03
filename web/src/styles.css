@@ -271,6 +271,79 @@ h3 {
   background: #fff;
 }
 
+.button-outline {
+  border-color: var(--color-border);
+  color: var(--color-foreground);
+  background: white;
+}
+
+.button-outline:hover:not(:disabled) {
+  border-color: #94a3b8;
+  background: #f8fafc;
+}
+
+.button-text {
+  border-color: transparent;
+  color: var(--color-primary);
+  background: transparent;
+  padding: 0.5rem 0.75rem;
+}
+
+.button-text:hover:not(:disabled) {
+  color: var(--color-primary-hover);
+  text-decoration: underline;
+}
+
+.link-button {
+  border: none;
+  background: transparent;
+  color: var(--color-primary);
+  font: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.link-button:hover {
+  color: var(--color-primary-hover);
+}
+
+.sign-in-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  margin-top: 1.2rem;
+}
+
+.sign-in-actions .button {
+  width: 100%;
+  margin: 0;
+}
+
+.sign-in-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin: 1rem 0;
+  color: var(--color-muted);
+  font-size: 0.82rem;
+}
+
+.sign-in-divider span {
+  flex: 1 1;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.sign-in-help {
+  margin: 1rem 0 0;
+  font-size: 0.82rem;
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 .dashboard-layout {
   display: grid;
   min-height: 100vh;
