@@ -72,7 +72,10 @@ class KeycloakAdmin:
             raise RuntimeError(
                 "KEYCLOAK_ADMIN_PASSWORD is required to configure Keycloak."
             )
-        resp = self._session.post(
+        # Token endpoint requires form-encoded body, not JSON.
+        headers = dict(self._session.headers)
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        resp = requests.post(
             f"{KEYCLOAK_URL}/realms/master/protocol/openid-connect/token",
             data={
                 "grant_type": "password",
@@ -80,6 +83,7 @@ class KeycloakAdmin:
                 "username": KEYCLOAK_ADMIN,
                 "password": KEYCLOAK_ADMIN_PASSWORD,
             },
+            headers=headers,
             timeout=30,
         )
         resp.raise_for_status()
@@ -231,7 +235,9 @@ class KeycloakAdmin:
         mappings_path = (
             f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{user_id}/role-mappings/realm"
         )
-        self._put(mappings_path, [role])
+        # Keycloak 26.x accepts POST to add realm role mappings to a user.
+        resp = self._session.post(mappings_path, json=[role], timeout=30)
+        resp.raise_for_status()
         print(
             f"[configure_keycloak] Granted realm role 'platform-admin' to dev admin."
         )

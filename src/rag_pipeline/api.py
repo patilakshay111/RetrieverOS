@@ -239,6 +239,8 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
             else None
         )
         app.state.vector_store = vector_store
+        if vector_store is not None:
+            vector_store.ensure_collection()
         app.state.checkpointer = None
         redis_client = (
             Redis.from_url(
