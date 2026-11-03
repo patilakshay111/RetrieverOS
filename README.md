@@ -10,8 +10,8 @@ The RAG workflow is implemented as a LangGraph `StateGraph` with Pydantic state 
 
 Contributions and issue reports are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development and pull request workflow.
 
-![Hybrid RAG Studio landing page](<img width="1853" height="797" alt="image" src="https://github.com/user-attachments/assets/75c9b76d-0276-4af6-84e1-bb739e752e2e" />
-)
+<img width="1853" height="797" alt="image" src="https://github.com/user-attachments/assets/2d6eeec8-812d-4346-a0a7-7d4b45a7529b" />
+
 
 ## Local multi-service stack
 
