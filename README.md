@@ -19,9 +19,13 @@ Contributions and issue reports are welcome. See [CONTRIBUTING.md](./CONTRIBUTIN
 
 ## Local multi-service stack
 
-The Compose file starts the API and dashboard plus local Postgres, Redis,
-Qdrant, Keycloak, and Mailpit services. Generate local-only service passwords
-and an encryption key, then add your OpenAI key:
+The Compose project is named `retrieveros` (images and volumes are
+`retrieveros-*`). The Compose file starts the API and dashboard plus local
+Postgres, Redis, Qdrant, Keycloak, and Mailpit services. The Keycloak
+service is **not** the stock image: it is built from `deploy/keycloak/Dockerfile`
+(stock `quay.io/keycloak/keycloak:26.3.2` plus the RetrieverOS provider in
+`deploy/keycloak-provider/`, see its README). Generate local-only service
+passwords and an encryption key, then add your OpenAI key:
 
 ```powershell
 python scripts/init_local_env.py
@@ -40,13 +44,24 @@ with that environment's `DATABASE_URL` before deploying the API.
 On a new Compose volume, Keycloak imports the `retrieveros` realm with the
 public `retrieveros-web` client, PKCE S256, and the API audience mapper.
 Registration requires email verification; local verification and password
-reset messages appear in Mailpit. To enable Google login, configure a Google
-identity provider in Keycloak using OAuth credentials from your own Google
-Cloud project; never put those credentials in source control or this chat.
-Keycloak does not re-import a realm over an existing persistent realm. If the
-volume already contains `retrieveros`, update that realm's web client and
-audience mapper in the Keycloak Admin Console rather than deleting identity
-data.
+reset messages appear in Mailpit. The realm also ships a custom
+`retrieveros first broker login` flow: Google identities must carry
+`email_verified=true` (checked against Google's verified identity claim) and
+matching Google accounts are auto-linked to the existing same-email local
+account without an additional challenge — unverified Google identities are
+rejected. No email-verification fallback is offered on this path, so a
+Google account that asserts an unverified email cannot take over an existing
+local account. To enable Google login, set `GOOGLE_OAUTH_CLIENT_ID` and
+`GOOGLE_OAUTH_CLIENT_SECRET` in `.env` to OAuth credentials from your own
+Google Cloud project (never put those credentials in source control or this
+chat), then run `python scripts/configure_keycloak.py` — it creates the
+Google IdP automatically and points you at the broker flow check. Keycloak does not re-import a
+realm over an existing persistent realm. If the volume already contains
+`retrieveros`, update that realm's web client and audience mapper in the
+Keycloak Admin Console rather than deleting identity data — note that an
+already-imported realm also keeps whatever `firstBrokerLoginFlow` it has;
+re-create the volume or import `deploy/keycloak/retrieveros-realm.json` to
+pick up the custom broker flow.
 
 The API verifies Keycloak access-token signatures, issuer, audience, and
 expiry. It resolves workspace membership and application permissions from
@@ -94,10 +109,11 @@ deployment.** The React dashboard, workspace authorization, invitation APIs,
 and cross-workspace audit logging are implemented. They have not yet been
 validated end to end with the local Compose stack. The local images built,
 all services became healthy, and `/readyz` reported Postgres, Qdrant, and Redis
-ready. Browser sign-in is currently blocked because the existing persistent
-Keycloak realm does not contain `retrieveros-web`; the realm was left unchanged.
-Add that client and its audience mapper before validating sign-in, invitations,
-two-user workspace isolation, or ingestion/chat. When both
+ready. Browser sign-in requires the `retrieveros` realm to be freshly imported
+(it ships the `retrieveros-web` client, its audience mapper, and the
+verified-Google-email broker flow); the pre-rename persistent Keycloak realm
+does not contain those, so re-create the volume before validating sign-in,
+invitations, two-user workspace isolation, or ingestion/chat. When both
 `QDRANT_URL` and `DATABASE_URL` are configured, ingestion writes vectors to
 Qdrant and current chunks to the PostgreSQL catalog, and retrieval uses those
 shared stores. Native development without both settings continues to use local
@@ -342,13 +358,15 @@ Open the Studio URL printed by the CLI to inspect `internal_docs_rag`; the serve
 ## Repository layout
 
 ```text
-src/rag_pipeline/   Application package, API, graph, and CLI entrypoints
-web/                React/TypeScript/Vite multi-user dashboard
-tests/              Offline unit and integration tests
-data/sample_docs/   Synthetic sample corpus used by the demo
-data/evaluation/    Golden evaluation dataset and generated results
-docs/               Public project documentation
-.private/           Local-only source/reference documents (Git-ignored)
+src/rag_pipeline/         Application package, API, graph, and CLI entrypoints
+web/                      React/TypeScript/Vite multi-user dashboard
+tests/                    Offline unit and integration tests
+data/sample_docs/         Synthetic sample corpus used by the demo
+data/evaluation/          Golden evaluation dataset and generated results
+deploy/keycloak/          Keycloak image + realm import (RetrieverOS Google-email gate)
+deploy/keycloak-provider/ Java source for the RetrieverOS broker authenticators
+docs/                     Public project documentation
+.private/                 Local-only source/reference documents (Git-ignored)
 ```
 
 The original requirements brief, interview rules, and engineering assessment are local references and are intentionally excluded from Git. The ignore rules are specific; Markdown files are not ignored globally, so the public docs and synthetic sample corpus remain part of the project.

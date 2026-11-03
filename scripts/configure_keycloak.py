@@ -7,7 +7,9 @@ Keycloak realm is ready for:
 * email/password sign-in, sign-up and password reset (already enabled in the
   realm import),
 * Google OAuth sign-in (federated identity provider), linked by email to the
-  same account,
+  same account — only for Google identities with a verified email, via the
+  custom retrieveros first broker login flow shipped in the realm import
+  (see deploy/keycloak-provider/),
 * outgoing mail through Gmail when Google OAuth credentials are configured,
   otherwise through Mailpit,
 * a developer admin account that can be used to test the platform.
@@ -280,6 +282,7 @@ class KeycloakAdmin:
         for inst in existing:
             if inst.get("providerId") == "google":
                 print("[configure_keycloak] Google identity provider already present.")
+                self.check_broker_flow()
                 return
 
         config = {
@@ -287,11 +290,12 @@ class KeycloakAdmin:
             "clientSecret": GOOGLE_CLIENT_SECRET,
             "alias": "google",
             "displayName": "Google",
-            "trustEmail": "true",  # auto-link a Google account to a local user
+            # Google has already verified the mailbox; the custom
+            # `retrieveros first broker login` flow enforces that
+            # (GoogleVerifiedEmailGateAuthenticator) before auto-linking.
+            "trustEmail": "true",
             "loginHint": "",
             "guiOrder": "",
-            "postBrokerLoginFlowIdentifier": "first broker login",
-            "firstBrokerLoginFlowIdentifier": "first broker login",
         }
         self._post(
             instances_path,
@@ -304,7 +308,32 @@ class KeycloakAdmin:
                 "trustEmail": True,
             },
         )
-        print("[configure_keycloak] Google identity provider added (auto-link email).")
+        print(
+            "[configure_keycloak] Google identity provider added "
+            "(verified-email auto-link via retrieveros first broker login)."
+        )
+        self.check_broker_flow()
+
+    def check_broker_flow(self) -> None:
+        """Warn when the realm does not use the RetrieverOS broker flow.
+
+        The flow is created by the realm import (fresh volumes). An already
+        imported realm keeps whatever flow it has, so call attention to it.
+        """
+        realm = self._get(f"{KEYCLOAK_URL}/admin/realms/{REALM}").json()
+        active = realm.get("firstBrokerLoginFlow")
+        if active == "retrieveros first broker login":
+            print("[configure_keycloak] Realm uses retrieveros first broker login flow.")
+            return
+        print(
+            "[configure_keycloak] WARNING: realm firstBrokerLoginFlow is "
+            f"{active!r}, expected 'retrieveros first broker login'.\n"
+            "  The custom flow is only created by the realm import on a fresh\n"
+            "  Keycloak volume. Re-create the volume (docker compose down -v &&\n"
+            "  docker compose up --build) or import deploy/keycloak/retrieveros-realm.json\n"
+            "  into the existing realm to enable the verified-Google-email gate.",
+            file=sys.stderr,
+        )
 
     def _ensure_dev_admin_user(self) -> dict[str, Any]:
         users_path = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users"

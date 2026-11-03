@@ -40,11 +40,17 @@ python -m alembic upgrade head
 ```
 
 Docker Compose overrides this with PostgreSQL and runs Alembic migrations
-before starting the API. On a new Keycloak data
-volume, Compose imports `deploy/keycloak/retrieveros-realm.json`, including the
-public React client configured for PKCE S256 and the API audience mapper.
-Keycloak does not overwrite an existing realm from an import; update an
-already-persisted `retrieveros` realm in the Keycloak Admin Console. Set
+before starting the API. The Keycloak service is the stock 26.3.2 image plus
+the RetrieverOS Google-verified-email provider, built from
+`deploy/keycloak-provider/` via `deploy/keycloak/Dockerfile`. On a new
+Keycloak data volume, Compose imports `deploy/keycloak/retrieveros-realm.json`,
+including the public React client configured for PKCE S256, the API audience
+mapper, and the custom `retrieveros first broker login` flow (Google identities
+must carry `email_verified=true`; existing same-email accounts are auto-linked
+only on a matching verified Google email). Keycloak does not overwrite an
+existing realm from an import; update an already-persisted `retrieveros`
+realm in the Keycloak Admin Console — an older persisted realm will also lack
+the custom flow, so import it there as well or re-create the volume. Set
 `SMTP_HOST`, `SMTP_PORT`, and `SMTP_FROM` to route invitation mail; Compose
 defaults to Mailpit at <http://localhost:8025>.
 

@@ -10,14 +10,26 @@
   "verifyEmail": false,
   "roles": {
     "realm": [
-      { "name": "employee" },
-      { "name": "hr" },
-      { "name": "ceo" },
-      { "name": "admin" },
-      { "name": "platform-admin" }
+      {
+        "name": "employee"
+      },
+      {
+        "name": "hr"
+      },
+      {
+        "name": "ceo"
+      },
+      {
+        "name": "admin"
+      },
+      {
+        "name": "platform-admin"
+      }
     ]
   },
-  "defaultRoles": ["employee"],
+  "defaultRoles": [
+    "employee"
+  ],
   "clients": [
     {
       "clientId": "retrieveros-api",
@@ -41,8 +53,12 @@
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "redirectUris": ["http://localhost:5173/*"],
-      "webOrigins": ["http://localhost:5173"],
+      "redirectUris": [
+        "http://localhost:5173/*"
+      ],
+      "webOrigins": [
+        "http://localhost:5173"
+      ],
       "attributes": {
         "pkce.code.challenge.method": "S256"
       },
@@ -318,5 +334,99 @@
     "port": "1025",
     "from": "no-reply@retrieveros.local",
     "fromDisplayName": "RetrieverOS"
-  }
+  },
+  "firstBrokerLoginFlow": "retrieveros first broker login",
+  "authenticationFlows": [
+    {
+      "alias": "retrieveros handle existing account",
+      "description": "Link an existing account only when the Google email is verified and matches the existing account",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "retrieveros-google-email-auto-link",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "autheticatorFlow": false,
+          "userSetupAllowed": false
+        }
+      ]
+    },
+    {
+      "alias": "retrieveros user creation or linking",
+      "description": "Create the Google account if absent, otherwise link on verified Google email",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticatorConfig": "retrieveros create unique user config",
+          "authenticator": "idp-create-user-if-unique",
+          "authenticatorFlow": false,
+          "requirement": "ALTERNATIVE",
+          "priority": 10,
+          "autheticatorFlow": false,
+          "userSetupAllowed": false
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "ALTERNATIVE",
+          "priority": 20,
+          "autheticatorFlow": true,
+          "flowAlias": "retrieveros handle existing account",
+          "userSetupAllowed": false
+        }
+      ]
+    },
+    {
+      "alias": "retrieveros first broker login",
+      "description": "Google broker login gated on a verified Google email; creates or verified-email-links the account",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "retrieveros-google-email-gate",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "autheticatorFlow": false,
+          "userSetupAllowed": false
+        },
+        {
+          "authenticatorConfig": "retrieveros review profile config",
+          "authenticator": "idp-review-profile",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 20,
+          "autheticatorFlow": false,
+          "userSetupAllowed": false
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "REQUIRED",
+          "priority": 30,
+          "autheticatorFlow": true,
+          "flowAlias": "retrieveros user creation or linking",
+          "userSetupAllowed": false
+        }
+      ]
+    }
+  ],
+  "authenticatorConfig": [
+    {
+      "alias": "retrieveros review profile config",
+      "config": {
+        "update.profile.on.first.login": "missing"
+      }
+    },
+    {
+      "alias": "retrieveros create unique user config",
+      "config": {
+        "require.password.update.after.registration": "false"
+      }
+    }
+  ]
 }

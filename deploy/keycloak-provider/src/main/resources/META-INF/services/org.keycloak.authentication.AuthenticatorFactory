@@ -1,0 +1,2 @@
+com.retrieveros.keycloak.auth.GoogleVerifiedEmailGateAuthenticatorFactory
+com.retrieveros.keycloak.auth.GoogleVerifiedEmailAutoLinkAuthenticatorFactory

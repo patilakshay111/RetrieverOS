@@ -1,3 +1,5 @@
+name: retrieveros
+
 services:
   api:
     build: .
@@ -135,7 +137,11 @@ services:
       retries: 5
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.3.2
+    build:
+      # Repository-root context so the Dockerfile can build the provider JAR.
+      context: .
+      dockerfile: deploy/keycloak/Dockerfile
+    image: retrieveros-keycloak:26.3.2
     command: ["start-dev", "--import-realm", "--http-port=8080", "--hostname-strict=false"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
