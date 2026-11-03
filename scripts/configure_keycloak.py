@@ -17,6 +17,7 @@ Environment variables (all optional with sensible dev defaults):
   KEYCLOAK_ADMIN            admin
   KEYCLOAK_ADMIN_PASSWORD   (from .env, required)
   KEYCLOAK_REALM            hybrid-rag
+  KEYCLOAK_WEB_CLIENT_ID    hybrid-rag-web
   GOOGLE_OAUTH_CLIENT_ID
   GOOGLE_OAUTH_CLIENT_SECRET
   SMTP_HOST / SMTP_PORT / SMTP_USERNAME / SMTP_PASSWORD / SMTP_USE_STARTTLS / SMTP_FROM
@@ -38,6 +39,7 @@ KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "http://localhost:8080").rstrip("/")
 KEYCLOAK_ADMIN = os.getenv("KEYCLOAK_ADMIN", "admin")
 KEYCLOAK_ADMIN_PASSWORD = os.getenv("KEYCLOAK_ADMIN_PASSWORD", "")
 REALM = os.getenv("KEYCLOAK_REALM", "hybrid-rag")
+KEYCLOAK_WEB_CLIENT_ID = os.getenv("KEYCLOAK_WEB_CLIENT_ID", "hybrid-rag-web")
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
@@ -159,6 +161,110 @@ class KeycloakAdmin:
             f"verifyEmail=False"
         )
 
+    def _get_web_client(self) -> dict[str, Any] | None:
+        clients = self._get(
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={KEYCLOAK_WEB_CLIENT_ID}"
+        ).json()
+        return clients[0] if clients else None
+
+    def configure_protocol_mappers(self) -> None:
+        # Ensure the web client has standard OIDC protocol mappers so the ID
+        # token includes sub, email, preferred_username, name, and roles.
+        client = self._get_web_client()
+        if not client:
+            print(
+                f"[configure_keycloak] Web client '{KEYCLOAK_WEB_CLIENT_ID}' not found, "
+                "skipping protocol mappers."
+            )
+            return
+
+        client_id = client["id"]
+        existing_path = (
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{client_id}"
+            f"/protocol-mappers/models"
+        )
+        existing: list[dict[str, Any]] = self._get(existing_path).json()
+        existing_names = {m.get("name") for m in existing}
+
+        mappers = [
+            {
+                "name": "sub",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-sub-mapper",
+                "consentRequired": False,
+                "config": {
+                    "id.token.claim": "true",
+                    "access.token.claim": "false",
+                    "userinfo.token.claim": "true",
+                },
+            },
+            {
+                "name": "email",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-usermodel-property-mapper",
+                "consentRequired": False,
+                "config": {
+                    "user.attribute": "email",
+                    "claim.name": "email",
+                    "jsonType.label": "String",
+                    "id.token.claim": "true",
+                    "access.token.claim": "false",
+                    "userinfo.token.claim": "true",
+                },
+            },
+            {
+                "name": "preferred_username",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-usermodel-property-mapper",
+                "consentRequired": False,
+                "config": {
+                    "user.attribute": "username",
+                    "claim.name": "preferred_username",
+                    "jsonType.label": "String",
+                    "id.token.claim": "true",
+                    "access.token.claim": "false",
+                    "userinfo.token.claim": "true",
+                },
+            },
+            {
+                "name": "full name",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-usermodel-property-mapper",
+                "consentRequired": False,
+                "config": {
+                    "user.attribute": "firstName",
+                    "claim.name": "name",
+                    "jsonType.label": "String",
+                    "id.token.claim": "true",
+                    "access.token.claim": "false",
+                    "userinfo.token.claim": "true",
+                },
+            },
+            {
+                "name": "realm roles",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-usermodel-realm-role-mapper",
+                "consentRequired": False,
+                "config": {
+                    "userattribute": "roles",
+                    "claim.name": "realm_access.roles",
+                    "jsonType.label": "String",
+                    "id.token.claim": "true",
+                    "access.token.claim": "true",
+                    "userinfo.token.claim": "true",
+                    "multivalued": "true",
+                },
+            },
+        ]
+
+        added = 0
+        for mapper in mappers:
+            if mapper["name"] in existing_names:
+                continue
+            self._post(existing_path, mapper)
+            added += 1
+        print(f"[configure_keycloak] Added {added} protocol mapper(s) to web client.")
+
     def configure_google_identity_provider(self) -> None:
         if not GOOGLE_CONFIGURED:
             print(
@@ -252,6 +358,7 @@ class KeycloakAdmin:
     def run(self) -> None:
         self._admin_token()
         self.configure_smtp()
+        self.configure_protocol_mappers()
         self.configure_google_identity_provider()
         dev_admin = self._ensure_dev_admin_user()
         self._grant_platform_admin_role(dev_admin)
