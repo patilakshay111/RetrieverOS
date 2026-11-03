@@ -1,22 +1,52 @@
+# Environment / secrets
 .env*
 !.env.example
+
+# Virtual environments
 .venv/
 .private/
 .langgraph_api/
+
+# Python caches & build artifacts
 __pycache__/
 .pytest_cache/
 .pytest-runtime.db
 .ruff_cache/
 .mypy_cache/
 *.py[cod]
-data/runtime/
-data/evaluation/results/
 *.egg-info/
 build/
 dist/
-node_modules/
 coverage/
+.tox/
+
+# Data & runtime outputs
+data/runtime/
+data/evaluation/results/
+
+# Node
+node_modules/
+web/dist/
+web/node_modules/
+
+# Streamlit
 .streamlit/secrets.toml
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Project-specific / internal (not for public release)
 INTERVIEW_CODE_RULES.md
 rag-pipeline-hybrid-search-internal-docs.md
 AGENT_ENGINEERING_ASSESSMENT.md
