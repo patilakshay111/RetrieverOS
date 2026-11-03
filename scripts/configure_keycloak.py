@@ -257,6 +257,22 @@ class KeycloakAdmin:
                     "multivalued": "true",
                 },
             },
+            {
+                # The API requires email_verified in the access token for
+                # invitation acceptance (oidc-usermodel-property-mapper).
+                "name": "email verified",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-usermodel-property-mapper",
+                "consentRequired": False,
+                "config": {
+                    "user.attribute": "emailVerified",
+                    "claim.name": "email_verified",
+                    "jsonType.label": "boolean",
+                    "id.token.claim": "true",
+                    "access.token.claim": "true",
+                    "userinfo.token.claim": "true",
+                },
+            },
         ]
 
         added = 0

@@ -192,8 +192,7 @@ excluded.
 
 ### Onboard users and test workspace access
 
-1. Register and verify a user through Keycloak. Local verification messages
-   appear in Mailpit at <http://localhost:8025>.
+1. Create an account from the sign-in page's Register link (the local dev realm does not require email verification) or sign in with a user created by `python scripts/configure_keycloak.py`; verification mail is not sent. Invitation and password-reset mail appears in Mailpit at <http://localhost:8025>.
 2. On first sign-in with no workspace memberships, enter a workspace name and
    description. The creator becomes that workspace's administrator. To create
    another isolated workspace later, use **Create another workspace**.
@@ -201,9 +200,9 @@ excluded.
    select its permissions, and save it before inviting a user. Assign one or
    more existing roles in the invitation form; role permissions are not
    Keycloak realm roles.
-4. The invitee registers with the invited email, verifies it through Mailpit,
-   and accepts the invitation. The app selects the invited workspace
-   automatically, even if this is the invitee's first workspace.
+4. The invitee registers with the invited email and accepts the invitation. The app selects the invited workspace
+   automatically, even if this is the invitee's first workspace. (The invitee's verified OIDC email must match
+   the invitation.)
 5. In **Documents**, choose a chunking strategy and one or more workspace
    roles for the document ACL. Non-admin members can assign only roles they
    hold. `documents:read` gates inventory, `documents:upload` gates new

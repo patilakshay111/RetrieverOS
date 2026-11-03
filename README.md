@@ -5,10 +5,7 @@
 [![CI](https://github.com/patilakshay111/RetrieverOS/actions/workflows/tests.yml/badge.svg)](https://github.com/patilakshay111/RetrieverOS/actions/workflows/tests.yml)
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/retrieveros-logo-dark.png" />
-    <img alt="RetrieverOS" src="docs/assets/retrieveros-logo-light.png" width="220" />
-  </picture>
+  <img alt="RetrieverOS" src="docs/assets/retrieveros-logo.png" width="220" />
 </p>
 
 A production-minded, open-source hybrid RAG application with a Python 3.11+ FastAPI backend and a React/TypeScript web dashboard. It supports Markdown, text, HTML, and PDF documents; local FAISS/BM25 retrieval and shared Qdrant/PostgreSQL dense and full-text retrieval; weighted Reciprocal Rank Fusion; an optional cross-encoder reranker; grounded OpenAI answers; per-claim citation checks; and confidence scoring.
@@ -31,6 +28,7 @@ passwords and an encryption key, then add your OpenAI key:
 python scripts/init_local_env.py
 notepad .env
 docker compose up --build
+python scripts/configure_keycloak.py   # creates the dev admin account (first run)
 ```
 
 The React dashboard is at <http://localhost:5173>, the API at
@@ -43,8 +41,13 @@ with that environment's `DATABASE_URL` before deploying the API.
 
 On a new Compose volume, Keycloak imports the `retrieveros` realm with the
 public `retrieveros-web` client, PKCE S256, and the API audience mapper.
-Registration requires email verification; local verification and password
-reset messages appear in Mailpit. The realm also ships a custom
+The local dev realm does **not** require email verification at registration
+— a new account can sign in immediately; verification mail is not sent.
+Password-reset and invitation emails are delivered by the configured SMTP,
+which defaults to the Mailpit catcher inbox. Run
+`python scripts/configure_keycloak.py` after the stack is healthy to create
+the developer admin (`dev@retrieveros.local` / `DevAdmin123!` by default)
+and, optionally, the Google identity provider. The realm also ships a custom
 `retrieveros first broker login` flow: Google identities must carry
 `email_verified=true` (checked against Google's verified identity claim) and
 matching Google accounts are auto-linked to the existing same-email local
@@ -89,7 +92,7 @@ grants audited platform-level access and does not replace workspace-local role
 definitions. Invitation acceptance requires the invitee's verified OIDC email
 to match the invitation; invitation tokens are stored hashed, expire after the
 configured period (72 hours by default), and can be accepted once. Configure
-`SMTP_*` in `.env`; Compose sends verification and invitation mail to Mailpit.
+`SMTP_*` in `.env`; Compose delivers invitation and password-reset mail to Mailpit.
 Privileged cross-workspace API access is recorded in PostgreSQL with an
 action, target, actor, timestamp, and request ID, without recording prompts,
 documents, answers, or tokens. The API applies workspace, owner, capability,
@@ -289,7 +292,7 @@ proxies API requests to the local API.
 
 ### 3. Use the application
 
-- Register and verify an account using the link in Mailpit, then sign in through Keycloak. If the account has no membership, create a named workspace; an invited user should accept the invitation using the invited email and will land in that workspace. Save a private OpenAI key in Account settings before asking or ingesting unless the API has a shared `OPENAI_API_KEY`.
+- Sign in via Keycloak with your email and password: use the developer admin account (`dev@retrieveros.local` / `DevAdmin123!`) created by `python scripts/configure_keycloak.py`, or create an account from the Register link on the sign-in page — the local dev realm does not require email verification, so the account works immediately. If the account has no membership, create a named workspace on first sign-in; an invited user accepts the invitation with the invited email and lands directly in that workspace. Save a private OpenAI key in Account settings before asking or ingesting unless the API has a shared `OPENAI_API_KEY`.
 - In Workspace, admins can edit the workspace name and description, create roles with explicit permissions, assign one or more roles to an invitation, and manage member roles. Keycloak realm roles do not define these workspace permissions.
 - Ask questions in the dashboard. Answers include retrieved evidence, citations, confidence breakdowns, and citation-verification results. Compare hybrid and dense-only retrieval from the chat workflow.
 - Upload supported Markdown, text, HTML, or PDF files from Documents and choose a chunking strategy and one or more workspace access roles. `documents:read`, `documents:upload`, and `documents:update` govern inventory, new uploads, and replacements respectively; `documents:query` governs chat and conversation history. The API also supports `/v1/documents`, `/v1/ask`, and `/v1/compare`.
