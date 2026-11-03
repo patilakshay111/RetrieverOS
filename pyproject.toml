@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "internal-docs-hybrid-rag"
+name = "retrieveros"
 version = "1.0.0"
-description = "Grounded internal-document Q&A with hybrid retrieval and citation checks."
+description = "RetrieverOS — grounded workspace-document Q&A with hybrid retrieval and citation checks."
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"

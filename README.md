@@ -1,17 +1,21 @@
-# Hybrid RAG Studio
+# RetrieverOS
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
-[![CI](https://github.com/patilakshay111/hybrid-rag-studio/actions/workflows/tests.yml/badge.svg)](https://github.com/patilakshay111/hybrid-rag-studio/actions/workflows/tests.yml)
+[![CI](https://github.com/patilakshay111/RetrieverOS/actions/workflows/tests.yml/badge.svg)](https://github.com/patilakshay111/RetrieverOS/actions/workflows/tests.yml)
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/retrieveros-logo-dark.png" />
+    <img alt="RetrieverOS" src="docs/assets/retrieveros-logo-light.png" width="220" />
+  </picture>
+</p>
 
 A production-minded, open-source hybrid RAG application with a Python 3.11+ FastAPI backend and a React/TypeScript web dashboard. It supports Markdown, text, HTML, and PDF documents; local FAISS/BM25 retrieval and shared Qdrant/PostgreSQL dense and full-text retrieval; weighted Reciprocal Rank Fusion; an optional cross-encoder reranker; grounded OpenAI answers; per-claim citation checks; and confidence scoring.
 
 The RAG workflow is implemented as a LangGraph `StateGraph` with Pydantic state and bounded recent-turn history. PostgreSQL deployments use the LangGraph PostgreSQL checkpointer and server-generated, user/workspace-scoped conversation IDs; local development can use the in-memory `MemorySaver`. The React dashboard supports Keycloak sign-in, isolated workspaces, document ingestion, chat with citations, retrieval comparison, invitations and role management, private API keys, and platform operations.
 
 Contributions and issue reports are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development and pull request workflow.
-
-<img width="1853" height="797" alt="image" src="https://github.com/user-attachments/assets/2d6eeec8-812d-4346-a0a7-7d4b45a7529b" />
-
 
 ## Local multi-service stack
 
@@ -33,14 +37,14 @@ Compose runs the Alembic database migration before starting the API.
 For an externally managed PostgreSQL database, run `alembic upgrade head`
 with that environment's `DATABASE_URL` before deploying the API.
 
-On a new Compose volume, Keycloak imports the `hybrid-rag` realm with the
-public `hybrid-rag-web` client, PKCE S256, and the API audience mapper.
+On a new Compose volume, Keycloak imports the `retrieveros` realm with the
+public `retrieveros-web` client, PKCE S256, and the API audience mapper.
 Registration requires email verification; local verification and password
 reset messages appear in Mailpit. To enable Google login, configure a Google
 identity provider in Keycloak using OAuth credentials from your own Google
 Cloud project; never put those credentials in source control or this chat.
 Keycloak does not re-import a realm over an existing persistent realm. If the
-volume already contains `hybrid-rag`, update that realm's web client and
+volume already contains `retrieveros`, update that realm's web client and
 audience mapper in the Keycloak Admin Console rather than deleting identity
 data.
 
@@ -91,7 +95,7 @@ and cross-workspace audit logging are implemented. They have not yet been
 validated end to end with the local Compose stack. The local images built,
 all services became healthy, and `/readyz` reported Postgres, Qdrant, and Redis
 ready. Browser sign-in is currently blocked because the existing persistent
-Keycloak realm does not contain `hybrid-rag-web`; the realm was left unchanged.
+Keycloak realm does not contain `retrieveros-web`; the realm was left unchanged.
 Add that client and its audience mapper before validating sign-in, invitations,
 two-user workspace isolation, or ingestion/chat. When both
 `QDRANT_URL` and `DATABASE_URL` are configured, ingestion writes vectors to

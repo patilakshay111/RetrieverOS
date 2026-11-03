@@ -90,9 +90,8 @@ export default function AppShell({
   return (
     <div className="dashboard-layout">
       <aside className="sidebar">
-        <a className="brand brand-sidebar" href="/" aria-label="Hybrid RAG Studio home">
-          <span className="brand-mark" aria-hidden="true">H</span>
-          <span>Hybrid RAG Studio</span>
+        <a className="brand brand-sidebar" href="/" aria-label="RetrieverOS home">
+          <img className="brand-logo brand-logo-sidebar" src="/logo-dark.png" alt="RetrieverOS" />
         </a>
         <p className="sidebar-label">Workspace</p>
         <label className="workspace-label">

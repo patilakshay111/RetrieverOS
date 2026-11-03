@@ -292,7 +292,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
                 vector_store.close()
 
     app = FastAPI(
-        title="Internal Docs Hybrid RAG",
+        title="RetrieverOS",
         version="1.0.0",
         description="Hybrid retrieval with grounded answers, citation verification, and confidence scoring.",
         lifespan=lifespan,

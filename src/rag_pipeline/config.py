@@ -85,7 +85,7 @@ class Settings:
             api_key=os.getenv("API_KEY") or None,
             oidc_issuer_url=os.getenv("OIDC_ISSUER_URL") or None,
             oidc_jwks_url=os.getenv("OIDC_JWKS_URL") or None,
-            oidc_audience=os.getenv("OIDC_AUDIENCE", "hybrid-rag-api"),
+            oidc_audience=os.getenv("OIDC_AUDIENCE", "retrieveros-api"),
             google_oauth_client_id=os.getenv("GOOGLE_OAUTH_CLIENT_ID") or None,
             google_oauth_client_secret=os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or None,
             database_url=os.getenv("DATABASE_URL") or None,
@@ -254,7 +254,7 @@ class Settings:
             "username": username,
             "password": password,
             "starttls": starttls,
-            "from": self.smtp_from or "Hybrid RAG <no-reply@hybrid-rag.local>",
+            "from": self.smtp_from or "RetrieverOS <no-reply@retrieveros.local>",
         }
 
     # Prevent an accidentally public API or unconfigured production model from starting.

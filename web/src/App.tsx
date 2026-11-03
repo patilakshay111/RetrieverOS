@@ -8,7 +8,7 @@ import {
   type Workspace,
 } from "./workspaces/WorkspaceProvider";
 
-const INVITATION_STORAGE_KEY = "hybrid-rag.invitation-token";
+const INVITATION_STORAGE_KEY = "retrieveros.invitation-token";
 
 function readInvitationToken(): string | null {
   const isInvitationPath = window.location.pathname === "/invite";
@@ -31,14 +31,13 @@ function removeInvitationTokenFromUrl() {
 }
 
 function LandingPage() {
-  const { login, register, loginWithGoogle, forgotPassword, error } = useAuth();
+  const { login, error } = useAuth();
 
   return (
     <main className="landing-layout">
       <section className="landing-intro">
-        <a className="brand" href="/" aria-label="Hybrid RAG Studio">
-          <span className="brand-mark" aria-hidden="true">H</span>
-          <span>Hybrid RAG Studio</span>
+        <a className="brand" href="/" aria-label="RetrieverOS home">
+          <img className="brand-logo" src="/logo-dark.png" alt="RetrieverOS" />
         </a>
         <div className="landing-copy">
           <p className="eyebrow">Private knowledge, grounded answers</p>
@@ -69,45 +68,18 @@ function LandingPage() {
           <p className="eyebrow">Welcome back</p>
           <h2 id="sign-in-title">Sign in to your workspace</h2>
           <p className="muted-copy">
-            Sign in with your organization account, or create a new one.
-            Sign-up and password reset are handled by your identity provider.
+            Continue using your organization account. Join an invitation or create a named workspace to get started.
           </p>
           {error && <p className="notice notice-error" role="alert">{error}</p>}
-          <div className="sign-in-actions">
-            <button
-              type="button"
-              className="button button-primary sign-in-button"
-              onClick={() => void login().catch(() => undefined)}
-            >
-              Sign in with email &amp; password
-            </button>
-            <button
-              type="button"
-              className="button button-outline sign-in-button"
-              onClick={() => void loginWithGoogle().catch(() => undefined)}
-            >
-              <span aria-hidden="true">G</span> Continue with Google
-            </button>
-          </div>
-          <p className="sign-in-divider"><span>or</span></p>
           <button
             type="button"
-            className="button button-text create-account-button"
-            onClick={() => void register().catch(() => undefined)}
+            className="button button-primary sign-in-button"
+            onClick={() => void login().catch(() => undefined)}
           >
-            Create an account
+            Continue with organization account
           </button>
-          <p className="sign-in-note sign-in-help">
-            <button
-              type="button"
-              className="link-button"
-              onClick={() => void forgotPassword().catch(() => undefined)}
-            >
-              Forgot your password?
-            </button>
-            &nbsp;·&nbsp;
-            Your session is managed by the identity provider. Access tokens stay
-            in memory.
+          <p className="sign-in-note">
+            Your session is managed by the identity provider. Access tokens stay in memory.
           </p>
         </div>
       </section>

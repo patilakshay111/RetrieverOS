@@ -25,9 +25,9 @@ def main() -> None:
             f"KEYCLOAK_ADMIN_PASSWORD={keycloak_password}",
         "USER_KEY_ENCRYPTION_KEY=generate-with-scripts-init-local-env":
             f"USER_KEY_ENCRYPTION_KEY={encryption_key}",
-        "DATABASE_URL=postgresql+psycopg://hybrid_rag:local-postgres-password-change-me@postgres:5432/hybrid_rag":
-            "DATABASE_URL=postgresql+psycopg://hybrid_rag:"
-            f"{postgres_password}@postgres:5432/hybrid_rag",
+        "DATABASE_URL=postgresql+psycopg://retrieveros:local-postgres-password-change-me@postgres:5432/retrieveros":
+            "DATABASE_URL=postgresql+psycopg://retrieveros:"
+            f"{postgres_password}@postgres:5432/retrieveros",
     }
     for old, new in replacements.items():
         template = template.replace(old, new)

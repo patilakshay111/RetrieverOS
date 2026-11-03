@@ -108,15 +108,14 @@ h3 {
   text-decoration: none;
 }
 
-.brand-mark {
-  display: grid;
-  width: 2rem;
-  height: 2rem;
-  place-items: center;
-  border: 1px solid rgb(255 255 255 / 35%);
-  border-radius: 0.65rem;
-  color: white;
-  background: var(--color-primary);
+.brand-logo {
+  display: block;
+  height: 4.5rem;
+  width: auto;
+}
+
+.brand-logo-sidebar {
+  height: 4rem;
 }
 
 .landing-copy {

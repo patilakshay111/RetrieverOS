@@ -2278,7 +2278,7 @@ def test_production_api_authentication():
         api_key=None,
         qdrant_url="http://qdrant.example.test:6333",
         redis_url="redis://redis.example.test:6379/0",
-        oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
+        oidc_issuer_url="https://identity.example.test/realms/retrieveros",
         openai_api_key="test-openai-key",
         database_url="postgresql+psycopg://user:password@localhost/test",
         user_key_encryption_key=Fernet.generate_key().decode("ascii"),
@@ -2320,8 +2320,8 @@ def test_oidc_verifier_validates_signature_issuer_audience_and_access_claims():
     from rag_pipeline.models import VerifiedIdentity
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    issuer = "https://identity.example.test/realms/hybrid-rag"
-    verifier = OIDCVerifier(issuer=issuer, audience="hybrid-rag-api")
+    issuer = "https://identity.example.test/realms/retrieveros"
+    verifier = OIDCVerifier(issuer=issuer, audience="retrieveros-api")
 
     class StaticSigningKey:
         key = private_key.public_key()
@@ -2335,7 +2335,7 @@ def test_oidc_verifier_validates_signature_issuer_audience_and_access_claims():
     now = datetime.now(timezone.utc)
     claims = {
         "iss": issuer,
-        "aud": "hybrid-rag-api",
+        "aud": "retrieveros-api",
         "sub": "user-123",
         "iat": now,
         "exp": now + timedelta(minutes=5),
@@ -2746,7 +2746,7 @@ def test_workspace_scope_uses_current_membership_not_token_claims(tmp_path):
         Settings.from_env(),
         app_env="test",
         api_key=None,
-        oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
+        oidc_issuer_url="https://identity.example.test/realms/retrieveros",
         database_url=database_url,
         user_key_encryption_key=Fernet.generate_key().decode("ascii"),
     )
@@ -2884,7 +2884,7 @@ def test_ask_uses_only_the_authenticated_users_openai_key():
         api_key=None,
         qdrant_url="http://qdrant.example.test:6333",
         redis_url="redis://redis.example.test:6379/0",
-        oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
+        oidc_issuer_url="https://identity.example.test/realms/retrieveros",
         openai_api_key=None,
         database_url="postgresql+psycopg://user:password@localhost/test",
         user_key_encryption_key=encryption_key,
@@ -3189,7 +3189,7 @@ def workspace_api(tmp_path):
         Settings.from_env(),
         app_env="test",
         api_key=None,
-        oidc_issuer_url="https://identity.example.test/realms/hybrid-rag",
+        oidc_issuer_url="https://identity.example.test/realms/retrieveros",
         database_url=database_url,
         user_key_encryption_key=Fernet.generate_key().decode("ascii"),
     )

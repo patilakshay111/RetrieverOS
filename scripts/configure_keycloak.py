@@ -16,8 +16,8 @@ Environment variables (all optional with sensible dev defaults):
   KEYCLOAK_URL              http://localhost:8080
   KEYCLOAK_ADMIN            admin
   KEYCLOAK_ADMIN_PASSWORD   (from .env, required)
-  KEYCLOAK_REALM            hybrid-rag
-  KEYCLOAK_WEB_CLIENT_ID    hybrid-rag-web
+  KEYCLOAK_REALM            retrieveros
+  KEYCLOAK_WEB_CLIENT_ID    retrieveros-web
   GOOGLE_OAUTH_CLIENT_ID
   GOOGLE_OAUTH_CLIENT_SECRET
   SMTP_HOST / SMTP_PORT / SMTP_USERNAME / SMTP_PASSWORD / SMTP_USE_STARTTLS / SMTP_FROM
@@ -38,14 +38,14 @@ load_dotenv()
 KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "http://localhost:8080").rstrip("/")
 KEYCLOAK_ADMIN = os.getenv("KEYCLOAK_ADMIN", "admin")
 KEYCLOAK_ADMIN_PASSWORD = os.getenv("KEYCLOAK_ADMIN_PASSWORD", "")
-REALM = os.getenv("KEYCLOAK_REALM", "hybrid-rag")
-KEYCLOAK_WEB_CLIENT_ID = os.getenv("KEYCLOAK_WEB_CLIENT_ID", "hybrid-rag-web")
+REALM = os.getenv("KEYCLOAK_REALM", "retrieveros")
+KEYCLOAK_WEB_CLIENT_ID = os.getenv("KEYCLOAK_WEB_CLIENT_ID", "retrieveros-web")
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
 GOOGLE_CONFIGURED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
 
-DEV_ADMIN_EMAIL = os.getenv("DEV_ADMIN_EMAIL", "dev@hybrid-rag.local")
+DEV_ADMIN_EMAIL = os.getenv("DEV_ADMIN_EMAIL", "dev@retrieveros.local")
 DEV_ADMIN_PASSWORD = os.getenv("DEV_ADMIN_PASSWORD", "DevAdmin123!")
 DEV_ADMIN_USERNAME = os.getenv("DEV_ADMIN_USERNAME", "dev.admin")
 
@@ -58,7 +58,7 @@ SMTP_USE_STARTTLS = os.getenv("SMTP_USE_STARTTLS", "false").strip().lower() in {
     "1",
     "yes",
 }
-SMTP_FROM = os.getenv("SMTP_FROM", "Hybrid RAG <no-reply@hybrid-rag.local>")
+SMTP_FROM = os.getenv("SMTP_FROM", "RetrieverOS <no-reply@retrieveros.local>")
 
 
 class KeycloakAdmin:
@@ -141,7 +141,7 @@ class KeycloakAdmin:
             "host": host,
             "port": port,
             "from": SMTP_FROM,
-            "fromDisplayName": "Hybrid RAG Studio",
+            "fromDisplayName": "RetrieverOS",
             "auth": auth,
             "ssl": ssl,
             "starttls": starttls,

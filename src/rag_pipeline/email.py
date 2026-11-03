@@ -26,11 +26,11 @@ class SMTPInvitationMailer:
 
     def send_invitation(self, email: str, invite_url: str) -> None:
         message = EmailMessage()
-        message["Subject"] = "You are invited to a Hybrid RAG workspace"
+        message["Subject"] = "You are invited to a RetrieverOS workspace"
         message["From"] = self._sender
         message["To"] = email
         message.set_content(
-            "You have been invited to join a Hybrid RAG workspace.\n\n"
+            "You have been invited to join a RetrieverOS workspace.\n\n"
             f"Accept the invitation: {invite_url}\n"
         )
         try:

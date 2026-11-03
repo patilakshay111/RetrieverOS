@@ -8,9 +8,9 @@ services:
       OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}
       OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
       API_KEY: ${API_KEY:-}
-      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-http://localhost:8080/realms/hybrid-rag}
-      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-http://keycloak:8080/realms/hybrid-rag/protocol/openid-connect/certs}
-      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-hybrid-rag-api}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-http://localhost:8080/realms/retrieveros}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-http://keycloak:8080/realms/retrieveros/protocol/openid-connect/certs}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-retrieveros-api}
       DATABASE_URL: ${DATABASE_URL:-}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1536}
@@ -30,7 +30,7 @@ services:
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_USE_STARTTLS: ${SMTP_USE_STARTTLS:-false}
-      SMTP_FROM: ${SMTP_FROM:-Hybrid RAG <no-reply@hybrid-rag.local>}
+      SMTP_FROM: ${SMTP_FROM:-RetrieverOS <no-reply@retrieveros.local>}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -65,8 +65,8 @@ services:
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
         VITE_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}
-        VITE_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hybrid-rag}
-        VITE_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_WEB_CLIENT_ID:-hybrid-rag-web}
+        VITE_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-retrieveros}
+        VITE_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_WEB_CLIENT_ID:-retrieveros-web}
     environment:
       KEYCLOAK_PUBLIC_ORIGIN: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}
       NGINX_ENVSUBST_FILTER: ^KEYCLOAK_PUBLIC_ORIGIN$
@@ -84,8 +84,8 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-hybrid_rag}
-      POSTGRES_USER: ${POSTGRES_USER:-hybrid_rag}
+      POSTGRES_DB: ${POSTGRES_DB:-retrieveros}
+      POSTGRES_USER: ${POSTGRES_USER:-retrieveros}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
       - "127.0.0.1:5432:5432"

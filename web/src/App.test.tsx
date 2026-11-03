@@ -39,13 +39,7 @@ describe("sign-in landing page", () => {
 
     expect(await screen.findByRole("heading", { name: "Sign in to your workspace" })).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Sign in with email & password" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /Continue with Google/ }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Create an account" }),
+      screen.getByRole("button", { name: "Continue with organization account" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("navigation")).not.toBeInTheDocument();
   });
@@ -80,7 +74,7 @@ describe("sign-in landing page", () => {
     expect(JSON.parse(String(acceptRequest?.[1]?.body))).toEqual({ token: invitationToken });
     expect(window.location.search).toBe("");
     expect(window.location.hash).toBe("");
-    expect(sessionStorage.getItem("hybrid-rag.invitation-token")).toBeNull();
+    expect(sessionStorage.getItem("retrieveros.invitation-token")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Continue to workspace" }));
     await waitFor(() => {

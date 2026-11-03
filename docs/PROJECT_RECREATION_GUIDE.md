@@ -1,4 +1,4 @@
-# Recreate the Internal Docs Hybrid RAG Project
+# Recreate the RetrieverOS Project
 
 This guide describes how to recreate and run the implemented project from a
 checkout. Python 3.11 is the tested CI version; do not treat the incomplete
@@ -41,10 +41,10 @@ python -m alembic upgrade head
 
 Docker Compose overrides this with PostgreSQL and runs Alembic migrations
 before starting the API. On a new Keycloak data
-volume, Compose imports `deploy/keycloak/hybrid-rag-realm.json`, including the
+volume, Compose imports `deploy/keycloak/retrieveros-realm.json`, including the
 public React client configured for PKCE S256 and the API audience mapper.
 Keycloak does not overwrite an existing realm from an import; update an
-already-persisted `hybrid-rag` realm in the Keycloak Admin Console. Set
+already-persisted `retrieveros` realm in the Keycloak Admin Console. Set
 `SMTP_HOST`, `SMTP_PORT`, and `SMTP_FROM` to route invitation mail; Compose
 defaults to Mailpit at <http://localhost:8025>.
 
