@@ -63,6 +63,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 function createOidcClient(): OidcClient {
   const client = new Keycloak(authConfig);
   const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const redirectUri = `${origin}/`;
   return {
     get authenticated() {
       return client.authenticated;
@@ -73,18 +74,20 @@ function createOidcClient(): OidcClient {
     get tokenParsed() {
       return client.tokenParsed;
     },
-    init: (options) => client.init(options),
-    login: () => client.login(),
+    init: (options) =>
+      client.init({ ...options, redirectUri }),
+    login: () =>
+      client.login({ redirectUri }),
     logout: () => client.logout(),
-    register: () => client.register(),
+    register: () => client.register({ redirectUri }),
     loginWithGoogle: () =>
-      (client as any).login({ idpHint: "google" }),
+      (client as any).login({ idpHint: "google", redirectUri }),
     forgotPassword: () => {
       const resetUrl = new URL(
         `${authConfig.url}/realms/${authConfig.realm}/login-actions/reset-credentials`
       );
       resetUrl.searchParams.set("client_id", authConfig.clientId);
-      resetUrl.searchParams.set("redirect_uri", `${origin}/`);
+      resetUrl.searchParams.set("redirect_uri", redirectUri);
       resetUrl.searchParams.set("scope", "openid");
       window.location.assign(resetUrl.toString());
       return Promise.resolve();
@@ -135,8 +138,14 @@ export function AuthProvider({
         if (!active) return;
         const authenticatedUser = client.authenticated ? getUser(client) : null;
         if (client.authenticated && !authenticatedUser) {
+          // Keycloak reports an authenticated session but the token has no
+          // usable identity (e.g. stale cookie after a fresh realm import).
+          // Clear it so the next login attempt starts clean.
+          client.clearToken();
           setStatus("error");
-          setError("The identity provider did not return a valid user identity.");
+          setError(
+            "The identity provider did not return a valid user identity. Try signing in again."
+          );
           return;
         }
         setUser(authenticatedUser);
@@ -161,6 +170,10 @@ export function AuthProvider({
   }, [client]);
 
   const login = useCallback(async () => {
+    // Clear any stale keycloak-js state (e.g. from a previous failed attempt
+    // or a realm reset) before starting a new sign-in.
+    client.clearToken();
+    setError(null);
     try {
       await client.login();
     } catch {
@@ -172,6 +185,8 @@ export function AuthProvider({
   }, [client]);
 
   const register = useCallback(async () => {
+    client.clearToken();
+    setError(null);
     try {
       await client.register();
     } catch {
@@ -183,6 +198,8 @@ export function AuthProvider({
   }, [client]);
 
   const loginWithGoogle = useCallback(async () => {
+    client.clearToken();
+    setError(null);
     try {
       await (client as any).login({ idpHint: "google" });
     } catch {
