@@ -149,8 +149,15 @@ class KeycloakAdmin:
             "replyToDisplayName": "",
             "envelopeFrom": "",
         }
+        # Dev convenience: don't require email verification so new users can
+        # sign in immediately. SMTP is still configured so password-reset
+        # emails work when needed.
+        realm["verifyEmail"] = False
         self._put(f"{KEYCLOAK_URL}/admin/realms/{REALM}", realm)
-        print(f"[configure_keycloak] SMTP configured: {host}:{port} (auth={auth})")
+        print(
+            f"[configure_keycloak] SMTP configured: {host}:{port} (auth={auth}), "
+            f"verifyEmail=False"
+        )
 
     def configure_google_identity_provider(self) -> None:
         if not GOOGLE_CONFIGURED:
