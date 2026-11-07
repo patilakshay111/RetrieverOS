@@ -2,11 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
-[![CI](https://github.com/patilakshay111/RetrieverOS/actions/workflows/tests.yml/badge.svg)](https://github.com/patilakshay111/RetrieverOS/actions/workflows/tests.yml)
-
-<p align="center">
-  <img alt="RetrieverOS" src="docs/assets/retrieveros-logo.png" width="220" />
-</p>
 
 A production-minded, open-source hybrid RAG application with a Python 3.11+ FastAPI backend and a React/TypeScript web dashboard. It supports Markdown, text, HTML, and PDF documents; local FAISS/BM25 retrieval and shared Qdrant/PostgreSQL dense and full-text retrieval; weighted Reciprocal Rank Fusion; an optional cross-encoder reranker; grounded OpenAI answers; per-claim citation checks; and confidence scoring.
 
